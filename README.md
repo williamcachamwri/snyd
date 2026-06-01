@@ -83,9 +83,9 @@ xychart-beta
 
 | Operation | Latency |
 |-----------|---------|
-| Add single file to 100K index | **1.13 µs** |
-| Remove single file | **53.7 ns** |
-| Update burst (100 cycles) | **112 µs** |
+| Add single file to 100K index | **0.00113 ms** |
+| Remove single file | **0.000054 ms** |
+| Update burst (100 cycles) | **0.112 ms** |
 
 ### Persist (rkyv + mmap)
 
@@ -104,26 +104,26 @@ All tests run on real files on disk. `find` and `mdfind` search the actual files
 
 | Query Type | snyd | `find` | `mdfind` | snyd vs find | snyd vs mdfind |
 |------------|------|--------|----------|--------------|----------------|
-| Exact match `budget_report_00000.xlsx` | **24.8 µs** | 2.73 ms | 20.8 ms | **110×** | **840×** |
-| Prefix `budget` | **17.1 µs** | 2.94 ms | 20.9 ms | **172×** | **1,220×** |
-| Fuzzy typo `bdgt` | **0.97 µs** | 2.94 ms | 20.9 ms | **3,030×** | **21,500×** |
-| Broad match `report` | **28.3 µs** | 2.97 ms | 20.9 ms | **105×** | **740×** |
-| Not found `xyz…` | **27.9 µs** | 2.94 ms | 20.9 ms | **105×** | **750×** |
+| Exact match `budget_report_00000.xlsx` | **0.025 ms** | 2.73 ms | 20.8 ms | **110×** | **840×** |
+| Prefix `budget` | **0.017 ms** | 2.94 ms | 20.9 ms | **172×** | **1,220×** |
+| Fuzzy typo `bdgt` | **0.001 ms** | 2.94 ms | 20.9 ms | **3,030×** | **21,500×** |
+| Broad match `report` | **0.028 ms** | 2.97 ms | 20.9 ms | **105×** | **740×** |
+| Not found `xyz…` | **0.028 ms** | 2.94 ms | 20.9 ms | **105×** | **750×** |
 
 #### 10,000 files
 
 | Query Type | snyd | `find` | `mdfind` | snyd vs find | snyd vs mdfind |
 |------------|------|--------|----------|--------------|----------------|
-| Exact match `budget_report_00000.xlsx` | **138 µs** | 10.6 ms | 21.1 ms | **77×** | **153×** |
-| Prefix `budget` | **162 µs** | 12.9 ms | 20.8 ms | **80×** | **128×** |
-| Fuzzy typo `bdgt` | **15.0 µs** | 13.8 ms | 20.8 ms | **920×** | **1,390×** |
-| Broad match `report` | **278 µs** | 13.4 ms | 20.6 ms | **48×** | **74×** |
-| Not found `xyz…` | **~150 µs** | 13.2 ms | 20.7 ms | **88×** | **138×** |
+| Exact match `budget_report_00000.xlsx` | **0.138 ms** | 10.6 ms | 21.1 ms | **77×** | **153×** |
+| Prefix `budget` | **0.162 ms** | 12.9 ms | 20.8 ms | **80×** | **128×** |
+| Fuzzy typo `bdgt` | **0.015 ms** | 13.8 ms | 20.8 ms | **920×** | **1,390×** |
+| Broad match `report` | **0.279 ms** | 13.4 ms | 20.6 ms | **48×** | **74×** |
+| Not found `xyz…` | **~0.150 ms** | 13.2 ms | 20.7 ms | **88×** | **138×** |
 
 ```mermaid
 xychart-beta
     title "Prefix query 'budget' latency by corpus size (lower is better)"
-    x-axis ["1K files snyd", "1K files find", "1K files mdfind", "10K files snyd", "10K files find", "10K files mdfind"]
+    x-axis ["1K snyd", "1K find", "1K mdfind", "10K snyd", "10K find", "10K mdfind"]
     y-axis "Latency (ms)" 0 --> 25
     bar [0.017, 2.94, 20.9, 0.162, 12.9, 20.8]
 ```
