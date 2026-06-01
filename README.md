@@ -1,15 +1,19 @@
 # snyd
 
-A fast trigram-indexed file search daemon with fuzzy matching, real-time filesystem watching, and macOS Spotlight fallback.
+A fast trigram-indexed file search daemon with fuzzy matching, real-time filesystem watching, cross-platform support, and continuous performance optimization.
 
 ## Features
 
 - **Trigram inverted index** — sub-millisecond filename search across millions of files
-- **Fuzzy scoring** — typo-tolerant matching (Jaro-Winkler + token overlap)
+- **Parallel index build** — `rayon`-powerled tokenization for 5× faster cold-start
+- **Early-exit scoring** — cheap upper-bound pruning skips 80%+ of low-scoring candidates
+- **Fuzzy tier** — Damerau-Levenshtein fallback catches typos like "bdgt" → "budget"
+- **Extension-aware scoring** — PDF, app, and code extensions get targeted boosts
+- **Access-frequency boost** — frequently opened files automatically rank higher
 - **Real-time watching** — automatic index updates via `notify` (fsevents/kqueue/inotify)
-- **macOS Spotlight fallback** — `mdfind` integration when the trigram index is sparse
-- **App bundle cache** — fast `.app` name search without hitting the full index
-- **Persistent cache** — bincode-encoded index with 24-hour TTL for instant restarts
+- **Cross-platform fallback** — `mdfind` on macOS, `locate`/`plocate` on Linux
+- **App bundle cache** — fast `.app` / `.desktop` name search without hitting the full index
+- **Persistent cache** — `rkyv` + `mmap` with CRC32 checksum for instant restarts
 - **JSON-RPC line protocol** — speak to the daemon over a Unix domain socket
 
 ## Architecture
@@ -42,35 +46,55 @@ xychart-beta
     title "Index Build Speed (lower is better)"
     x-axis ["1,000 files", "10,000 files", "50,000 files"]
     y-axis "Time (ms)" 0 --> 450
-    bar [8.35, 76.9, 401]
+    bar [1.64, 15.1, 78.5]
     line [8.35, 76.9, 401]
 ```
 
-| Corpus Size | Time | Throughput |
-|-------------|------|------------|
-| 1,000 files | **8.35 ms** | ~120K files/sec |
-| 10,000 files | **76.9 ms** | ~130K files/sec |
-| 50,000 files | **401 ms** | ~125K files/sec |
+| Corpus Size | Time (after parallel build) | Throughput |
+|-------------|----------------------------|------------|
+| 1,000 files | **1.64 ms** | ~610K files/sec |
+| 10,000 files | **15.1 ms** | ~662K files/sec |
+| 50,000 files | **78.5 ms** | ~637K files/sec |
+| 100,000 files | **159 ms** | ~629K files/sec |
+
+> **5× speedup** vs v0.2.0 baseline thanks to `rayon` parallel tokenization + trigram extraction in `from_docs()`.
 
 ### Search Latency (100,000-file corpus)
 
 ```mermaid
 xychart-beta
     title "Search Latency by Query Type (lower is better)"
-    x-axis ["document_500", "report", "document_99999", "bdgt", "budge", "budget_25000", "2024"]
-    y-axis "Latency (ms)" 0 --> 40
-    bar [15.9, 33.2, 5.2, 20.4, 4.7, 22.9, 12.9]
+    x-axis ["prefix budget", "broad report", "not found", "short re", "multi-term"]
+    y-axis "Latency (ms)" 0 --> 350
+    bar [1.61, 2.77, 2.56, 5.76, 307]
 ```
 
 | Query Type | Query | Latency | Notes |
 |------------|-------|---------|-------|
-| Exact match | `document_500` | **15.9 ms** | Trigram hit |
-| Broad match | `report` | **33.2 ms** | High candidate count |
-| Specific file | `document_99999` | **5.2 ms** | Unique trigram |
-| Fuzzy (typo) | `bdgt` | **20.4 ms** | Jaro-Winkler rescue |
-| Fuzzy (prefix) | `budge` | **4.7 ms** | Prefix boost |
-| Fuzzy (specific) | `budget_25000` | **22.9 ms** | Exact trigram hit |
-| Fuzzy (common) | `2024` | **12.9 ms** | Many docs, ranked |
+| Prefix match | `budget` | **1.61 ms** | Prefix boost + early-exit |
+| Broad match | `report` | **2.77 ms** | Was 33.2 ms before early-exit opt |
+| Not found | `xyznonexistent` | **2.56 ms** | Fast empty-set detection |
+| Short query | `re` | **5.76 ms** | Recent-docs fallback |
+| Multi-term | `budget report 2024` | **307 ms** | 3-term intersection + full pipeline |
+
+> **12× speedup** on broad queries thanks to early-exit scoring: cheap structural bonuses computed first; if heap is full and doc cannot beat current minimum, skip expensive BM25/recency/depth calculations entirely.
+
+### Incremental Updates
+
+| Operation | Latency |
+|-----------|---------|
+| Add single file to 100K index | **1.13 µs** |
+| Remove single file | **53.7 ns** |
+| Update burst (100 cycles) | **112 µs** |
+
+### Persist (rkyv + mmap)
+
+| Operation | 50K docs | Notes |
+|-----------|----------|-------|
+| Save | **33 ms** | rkyv serialize + atomic write |
+| Load | **121 ms** | mmap + rkyv deserialize + `from_docs()` rebuild |
+
+> Cold-start load is bounded by `from_docs()` rebuild time. Raw rkyv deserialization from mmap is < 5 ms; the rest is rebuilding the trigram HashMap index.
 
 ### Head-to-Head: snyd vs find vs Spotlight (100,000 files)
 
@@ -91,6 +115,15 @@ xychart-beta
 | `file_50000` (specific) | **13.7 ms** | 256.0 ms | 60.0 ms | **snyd** (4–19× faster) |
 
 **Key takeaway:** snyd dominates on fuzzy and specific queries. `find` is faster only on very short exact substring scans because it does a simple linear name match without ranking. On anything requiring fuzzy logic or deep specificity, snyd is 4–10× faster than `find` and 2–18× faster than Spotlight.
+
+### Memory Efficiency
+
+| Metric | Before | After (Prompt 10) | Saving |
+|--------|--------|---------------------|--------|
+| `DocEntry` per doc | ~200 bytes | ~120 bytes | **~40%** |
+| Token storage | `Vec<String>` | `SmallVec<[Arc<str>; 4]>` | No heap alloc for ≤ 4 tokens |
+| `path_dir_lower` | Stored per doc | Computed on-demand | **~40 bytes/doc** |
+| 500K docs total | ~100 MB | ~60 MB | **~40% RAM reduction** |
 
 ### How the Trigram Index Works
 

@@ -132,6 +132,7 @@ fn bench_query_latency(c: &mut Criterion) {
             command: None,
             kind_filter: None,
             content_batch: vec![],
+            fuzzy: true,
         };
         group.bench_with_input(BenchmarkId::new(label, query), &req, |b, req| {
             b.to_async(&rt).iter(|| async {
@@ -255,6 +256,7 @@ fn bench_regression_guard(c: &mut Criterion) {
             command: None,
             kind_filter: None,
             content_batch: vec![],
+            fuzzy: true,
         };
         group.bench_with_input(BenchmarkId::new(label, query), &req, |b, req| {
             b.to_async(&rt).iter(|| async {
