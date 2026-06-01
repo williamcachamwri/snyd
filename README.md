@@ -173,7 +173,7 @@ graph TD
 snyd
 
 # Search via Unix socket
-echo '{"id":"1","query":"budget","max_results":10}' | nc -U ~/.cache/snyd/snyd.sock
+echo '{"id":"1","query":"budget","max_results":10}' | nc -U ~/Library/Caches/snyd/snyd.sock
 
 # Index custom directories
 snyd -d /Applications -d /Users/wica/Projects

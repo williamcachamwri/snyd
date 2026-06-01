@@ -11,7 +11,7 @@
 //! snyd
 //!
 //! # Search via Unix socket (JSON-RPC line protocol)
-//! echo '{"id":"1","query":"budget","max_results":10}' | nc -U ~/.cache/snyd/snyd.sock
+//! echo '{"id":"1","query":"budget","max_results":10}' | nc -U ~/Library/Caches/snyd/snyd.sock
 //! ```
 //!
 //! ## Protocol
