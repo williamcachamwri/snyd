@@ -17,15 +17,35 @@ pub struct AppCache {
 
 impl AppCache {
     /// Load app bundles from the given directories.
+    /// Uses platform-specific default directories when `dirs` is empty.
     pub fn load(dirs: &[PathBuf]) -> Self {
         let mut entries = Vec::new();
 
-        for dir in dirs {
+        let default_dirs: Vec<PathBuf> = if dirs.is_empty() {
+            #[cfg(target_os = "macos")]
+            {
+                vec![PathBuf::from("/Applications")]
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                vec![
+                    PathBuf::from("/usr/share/applications"),
+                    PathBuf::from("/usr/local/share/applications"),
+                    dirs::home_dir()
+                        .map(|h| h.join(".local/share/applications"))
+                        .unwrap_or_default(),
+                ]
+            }
+        } else {
+            dirs.to_vec()
+        };
+
+        for dir in &default_dirs {
             if let Ok(read_dir) = std::fs::read_dir(dir) {
                 for entry in read_dir.flatten() {
                     let path = entry.path();
                     if is_app_dir(&path) {
-                        if let Some(app) = parse_app_bundle(&path) {
+                        if let Some(app) = parse_app_entry(&path) {
                             entries.push(app);
                         }
                     }
@@ -114,6 +134,21 @@ pub fn app_to_result(app: &AppEntry, score: f32) -> crate::protocol::SearchResul
     }
 }
 
+/// Platform-agnostic entry point — dispatches to macOS or Linux parser.
+fn parse_app_entry(path: &Path) -> Option<AppEntry> {
+    #[cfg(target_os = "macos")]
+    {
+        parse_app_bundle(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        parse_desktop_file(path)
+    }
+}
+
+// ── macOS ──────────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
 fn is_app_dir(path: &Path) -> bool {
     path.is_dir()
         && path
@@ -123,7 +158,7 @@ fn is_app_dir(path: &Path) -> bool {
             .unwrap_or(false)
 }
 
-/// Parse a macOS .app bundle for display name using the plist crate.
+#[cfg(target_os = "macos")]
 fn parse_app_bundle(path: &Path) -> Option<AppEntry> {
     let info_plist = path.join("Contents/Info.plist");
     if !info_plist.exists() {
@@ -150,7 +185,7 @@ fn parse_app_bundle(path: &Path) -> Option<AppEntry> {
     })
 }
 
-/// Fallback when plist parsing fails.
+#[cfg(target_os = "macos")]
 fn fallback_app_name(path: &Path) -> Option<AppEntry> {
     let name = path
         .file_stem()
@@ -160,6 +195,59 @@ fn fallback_app_name(path: &Path) -> Option<AppEntry> {
     Some(AppEntry {
         path: path.to_string_lossy().to_string(),
         display_name: name,
+    })
+}
+
+// ── Linux ──────────────────────────────────────────────────────────────────
+
+#[cfg(not(target_os = "macos"))]
+fn is_app_dir(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e == "desktop")
+            .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn parse_desktop_file(path: &Path) -> Option<AppEntry> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut name = None;
+    let mut is_app = false;
+
+    for line in content.lines() {
+        if line.trim() == "[Desktop Entry]" {
+            is_app = true;
+            continue;
+        }
+        if line.starts_with('[') {
+            // New section — break if we've passed Desktop Entry
+            if is_app {
+                break;
+            }
+            continue;
+        }
+        if let Some(val) = line.strip_prefix("Name=") {
+            name = Some(val.trim().to_string());
+        }
+        if let Some(val) = line.strip_prefix("Type=") {
+            if val.trim() != "Application" {
+                return None; // Not an app
+            }
+        }
+    }
+
+    let display_name = name.unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Unknown")
+            .to_string()
+    });
+
+    Some(AppEntry {
+        path: path.to_string_lossy().to_string(),
+        display_name,
     })
 }
 

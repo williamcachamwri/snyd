@@ -91,6 +91,11 @@ impl IndexWatcher {
 
             for scope in &scopes {
                 if let Err(e) = watcher.watch(scope.as_path(), RecursiveMode::Recursive) {
+                    #[cfg(target_os = "linux")]
+                    if e.to_string().contains("No space") {
+                        eprintln!("inotify watch limit reached. Run:");
+                        eprintln!("  echo 'fs.inotify.max_user_watches=524288' | sudo tee -a /etc/sysctl.conf && sudo sysctl -p");
+                    }
                     warn!("Failed to watch {}: {}", scope.display(), e);
                 }
             }

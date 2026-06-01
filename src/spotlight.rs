@@ -13,15 +13,6 @@ use crate::kinds::kind_from_path;
 use crate::protocol::SearchResult;
 
 /// Escape special characters in a Spotlight (mdfind) predicate.
-///
-/// Spotlight predicates treat `*` and `?` as wildcards. If the user's query
-/// contains these characters we must escape them so they match literal file
-/// names rather than expanding to match everything.  `\` and `'` are escaped so
-/// they do not break the predicate syntax, and `(` / `)` are escaped because
-/// Spotlight uses them for grouping.
-///
-/// The replacement order matters: `\\` must be substituted first, otherwise the
-/// backslashes we insert later would themselves be escaped.
 fn escape_spotlight_predicate(query: &str) -> String {
     query
         .replace('\\', "\\\\")
@@ -55,24 +46,20 @@ mod tests {
     fn test_score_relevant_result_higher_than_irrelevant() {
         let score_relevant = jaro_winkler("notes", "notes") as f32 * 0.5;
         let score_irrelevant = jaro_winkler("notes", "zxqwerty") as f32 * 0.5;
-        assert!(score_relevant > score_irrelevant,
+        assert!(
+            score_relevant > score_irrelevant,
             "relevant spotlight result should score higher: {} vs {}",
-            score_relevant, score_irrelevant);
+            score_relevant,
+            score_irrelevant
+        );
     }
 }
 
-/// A handle to a running mdfind subprocess that kills on drop.
-pub struct MdfindHandle {
-    child: tokio::process::Child,
-}
+// ═════════════════════════════════════════════════════════════════════════════
+// macOS: mdfind
+// ═════════════════════════════════════════════════════════════════════════════
 
-impl Drop for MdfindHandle {
-    fn drop(&mut self) {
-        let _ = self.child.start_kill();
-    }
-}
-
-/// Run a Spotlight search via mdfind and stream results.
+#[cfg(target_os = "macos")]
 pub async fn search(
     query: &str,
     scopes: &[PathBuf],
@@ -83,6 +70,7 @@ pub async fn search(
     MdfindStream::start(query, scopes, max).await
 }
 
+#[cfg(target_os = "macos")]
 struct MdfindStream {
     lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     _handle: MdfindHandle,
@@ -90,6 +78,19 @@ struct MdfindStream {
     query_lower: String,
 }
 
+#[cfg(target_os = "macos")]
+struct MdfindHandle {
+    child: tokio::process::Child,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MdfindHandle {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
+}
+
+#[cfg(target_os = "macos")]
 impl MdfindStream {
     async fn start(query: String, scopes: Vec<PathBuf>, max: usize) -> Self {
         let query_lower = query.to_lowercase();
@@ -109,7 +110,6 @@ impl MdfindStream {
             Ok(c) => c,
             Err(e) => {
                 error!("Failed to spawn mdfind: {}", e);
-                // Return an empty stream using a dummy child
                 let mut dummy = Command::new("true").stdout(Stdio::piped()).spawn().unwrap();
                 let stdout = dummy.stdout.take().unwrap();
                 return MdfindStream {
@@ -133,6 +133,7 @@ impl MdfindStream {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl Stream for MdfindStream {
     type Item = SearchResult;
 
@@ -157,9 +158,6 @@ impl Stream for MdfindStream {
                     let kind = kind_from_path(path);
                     self.remaining -= 1;
 
-                    // Score based on Jaro-Winkler similarity between query and filename.
-                    // Capped at 0.5 so Spotlight results never outrank trigram index results
-                    // (exact match in index = 500/800 ≈ 0.625).
                     let jw = jaro_winkler(&self.query_lower, &name.to_lowercase()) as f32;
                     let score = (jw * 0.5).clamp(0.1, 0.5);
 
@@ -175,6 +173,144 @@ impl Stream for MdfindStream {
                 Poll::Ready(Ok(None)) => return Poll::Ready(None),
                 Poll::Ready(Err(e)) => {
                     warn!("Error reading mdfind output: {}", e);
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Linux: locate / plocate
+// ═════════════════════════════════════════════════════════════════════════════
+
+#[cfg(not(target_os = "macos"))]
+pub async fn search(
+    query: &str,
+    scopes: &[PathBuf],
+    max: usize,
+) -> impl Stream<Item = SearchResult> {
+    let query = query.to_string();
+    let scopes = scopes.to_vec();
+    LocateStream::start(query, scopes, max).await
+}
+
+#[cfg(not(target_os = "macos"))]
+struct LocateStream {
+    lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    remaining: usize,
+    query_lower: String,
+    scopes: Vec<PathBuf>,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl LocateStream {
+    async fn start(query: String, scopes: Vec<PathBuf>, max: usize) -> Self {
+        let query_lower = query.to_lowercase();
+
+        // Try plocate first (faster, newer), fallback to locate
+        let mut child = Command::new("plocate")
+            .arg("-l")
+            .arg(max.to_string())
+            .arg(&query)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+
+        if child.is_err() {
+            child = Command::new("locate")
+                .arg(&query)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn();
+        }
+
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to spawn locate/plocate: {}", e);
+                let mut dummy = Command::new("true").stdout(Stdio::piped()).spawn().unwrap();
+                let stdout = dummy.stdout.take().unwrap();
+                return LocateStream {
+                    lines: BufReader::new(stdout).lines(),
+                    remaining: 0,
+                    query_lower,
+                    scopes,
+                };
+            }
+        };
+
+        let stdout = child.stdout.take().expect("piped stdout");
+        let lines = BufReader::new(stdout).lines();
+
+        LocateStream {
+            lines,
+            remaining: max,
+            query_lower,
+            scopes,
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl Stream for LocateStream {
+    type Item = SearchResult;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.remaining == 0 {
+            return Poll::Ready(None);
+        }
+
+        loop {
+            match std::pin::Pin::new(&mut self.lines).poll_next_line(cx) {
+                Poll::Ready(Ok(Some(line))) => {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let path = std::path::Path::new(&line);
+
+                    // Filter to requested scopes
+                    let in_scope = self.scopes.is_empty()
+                        || self
+                            .scopes
+                            .iter()
+                            .any(|scope| line.starts_with(scope.to_string_lossy().as_ref()));
+                    if !in_scope {
+                        continue;
+                    }
+
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    let kind = kind_from_path(path);
+                    self.remaining -= 1;
+
+                    let jw = jaro_winkler(&self.query_lower, &name.to_lowercase()) as f32;
+                    let score = (jw * 0.5).clamp(0.1, 0.5);
+
+                    let mtime = std::fs::metadata(path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+
+                    return Poll::Ready(Some(SearchResult {
+                        path: line,
+                        name,
+                        kind,
+                        size: 0,
+                        modified: mtime,
+                        score,
+                    }));
+                }
+                Poll::Ready(Ok(None)) => return Poll::Ready(None),
+                Poll::Ready(Err(e)) => {
+                    warn!("Error reading locate output: {}", e);
                     return Poll::Ready(None);
                 }
                 Poll::Pending => return Poll::Pending,
