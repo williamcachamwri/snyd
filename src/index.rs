@@ -2,6 +2,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use jwalk::WalkDir;
+use rayon::prelude::*;
 use roaring::bitmap::RoaringBitmap;
 use tracing::warn;
 
@@ -250,20 +251,38 @@ impl TrigramIndex {
     ///
     /// Re-tokenizes names, rebuilds trigram bitmaps, doc_freq, and avg_doc_len.
     /// Deleted docs are filtered out.
+    ///
+    /// **Parallel build:** tokenization and trigram extraction run in parallel
+    /// via rayon. The sequential merge phase builds the HashMap index.
     pub fn from_docs(raw_docs: Vec<DocEntry>) -> Self {
-        let mut docs: Vec<DocEntry> = Vec::with_capacity(raw_docs.len());
-        let mut index: HashMap<[char; 3], RoaringBitmap> = HashMap::with_capacity(raw_docs.len());
-        let mut path_to_id: HashMap<String, u32> = HashMap::with_capacity(raw_docs.len());
+        // Phase 1 (parallel): tokenize, extract trigrams, acronym, path_dir for each doc
+        let prepped: Vec<_> = raw_docs
+            .into_par_iter()
+            .filter(|doc| !doc.deleted)
+            .map(|mut doc| {
+                let name_lower = doc.name_lower.to_lowercase();
+                let terms = tokenize(&name_lower);
+                let path_dir_lower = Path::new(&doc.path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                let acronym = extract_acronym(&name_lower);
+                let trigrams = extract_trigrams(&name_lower);
+                doc.tokens = terms.clone();
+                doc.path_dir_lower = path_dir_lower;
+                doc.acronym = acronym;
+                (doc, terms, trigrams)
+            })
+            .collect();
+
+        // Phase 2 (sequential): merge into index structures
+        let mut docs: Vec<DocEntry> = Vec::with_capacity(prepped.len());
+        let mut index: HashMap<[char; 3], RoaringBitmap> = HashMap::with_capacity(prepped.len());
+        let mut path_to_id: HashMap<String, u32> = HashMap::with_capacity(prepped.len());
         let mut doc_freq: HashMap<String, u32> = HashMap::new();
         let mut total_doc_len: f32 = 0.0;
 
-        for mut doc in raw_docs {
-            if doc.deleted {
-                continue;
-            }
-
-            let name_lower = doc.name_lower.to_lowercase();
-            let terms = tokenize(&name_lower);
+        for (doc, terms, trigrams) in prepped {
             let mut seen_terms = HashSet::new();
             for term in &terms {
                 if seen_terms.insert(term.clone()) {
@@ -272,21 +291,10 @@ impl TrigramIndex {
             }
             total_doc_len += terms.len() as f32;
 
-            let path_dir_lower = Path::new(&doc.path)
-                .parent()
-                .map(|p| p.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
-            let acronym = extract_acronym(&name_lower);
-
-            doc.tokens = terms.clone();
-            doc.path_dir_lower = path_dir_lower;
-            doc.acronym = acronym;
             let doc_id = docs.len() as u32;
             path_to_id.insert(doc.path.clone(), doc_id);
             docs.push(doc);
 
-            // Insert trigrams (char-based)
-            let trigrams = extract_trigrams(&name_lower);
             for tri in trigrams {
                 index.entry(tri).or_default().insert(doc_id);
             }
@@ -327,7 +335,7 @@ impl TrigramIndex {
     /// If the heap is already full and the doc's best-case score (cheap + max remaining)
     /// cannot beat the current minimum, the doc is skipped entirely — no BM25, no recency,
     /// no depth/path calculations.
-    pub fn query(&self, query: &str, max: usize) -> Vec<ScoredDoc> {
+    pub fn query(&self, query: &str, max: usize, fuzzy: bool) -> Vec<ScoredDoc> {
         let query_lower = query.to_lowercase();
         let query_terms = tokenize(&query_lower);
 
@@ -347,6 +355,31 @@ impl TrigramIndex {
             }
             result.unwrap_or_default().into_iter().collect()
         };
+
+        // ── Fuzzy fallback: if trigram intersection yields < 5 docs, scan all docs
+        // with Damerau-Levenshtein distance heuristic to catch typos like "bdgt" → "budget".
+        if candidate_ids.len() < 5 && fuzzy {
+            let max_dist = (query_lower.len() / 4).max(1).min(2);
+            let mut extra = Vec::new();
+            for (i, doc) in self.docs.iter().enumerate() {
+                if doc.deleted {
+                    continue;
+                }
+                // Fast reject: length difference > max_dist
+                if doc.name_lower.len().abs_diff(query_lower.len()) > max_dist as usize {
+                    continue;
+                }
+                let dist = strsim::damerau_levenshtein(&query_lower, &doc.name_lower);
+                if dist <= max_dist {
+                    extra.push(i as u32);
+                }
+            }
+            let mut set: HashSet<u32> = candidate_ids.into_iter().collect();
+            for id in extra {
+                set.insert(id);
+            }
+            candidate_ids = set.into_iter().collect();
+        }
 
         // ── Optimization B: pre-sort candidates by term coverage (desc) ───
         // High-coverage docs are more likely to score well → fill heap faster →
@@ -1078,7 +1111,7 @@ mod tests {
             ("/b/foobar.txt".into(), "foobar".into(), 0),
             ("/c/bar.txt".into(), "bar".into(), 0),
         ]);
-        let scored = idx.query("foo", 10);
+        let scored = idx.query("foo", 10, true);
         assert_eq!(scored[0].doc_id, 0); // exact match "foo"
     }
 
@@ -1088,7 +1121,7 @@ mod tests {
             ("/a/xcode.app".into(), "Xcode".into(), 0),
             ("/b/com.example.xco.plist".into(), "com.example.xco".into(), 0),
         ]);
-        let scored = idx.query("xco", 10);
+        let scored = idx.query("xco", 10, true);
         assert_eq!(scored[0].doc_id, 0); // "Xcode" prefix beats contains
     }
 
@@ -1102,7 +1135,7 @@ mod tests {
             ("/a/old.txt".into(), "report".into(), now - 5_184_000), // 60 days ago
             ("/b/new.txt".into(), "report".into(), now - 1_800),    // 30 min ago
         ]);
-        let scored = idx.query("report", 10);
+        let scored = idx.query("report", 10, true);
         assert_eq!(scored[0].doc_id, 1); // newer file wins
     }
 
@@ -1112,7 +1145,7 @@ mod tests {
             ("/Applications/Foo.app".into(), "Foo".into(), 0),
             ("/Users/x/a/b/c/d/Foo.app".into(), "Foo".into(), 0),
         ]);
-        let scored = idx.query("foo", 10);
+        let scored = idx.query("foo", 10, true);
         assert_eq!(scored[0].doc_id, 0); // shallow path wins
     }
 
@@ -1128,7 +1161,7 @@ mod tests {
             ("/c/baz.txt".into(), "baz".into(), now - 100),
         ]);
         // 2-char query => short-query path; "baz" is most recent and starts with "ba"
-        let scored = idx.query("ba", 10);
+        let scored = idx.query("ba", 10, true);
         assert_eq!(scored[0].doc_id, 2); // most recent doc wins
     }
 
@@ -1142,7 +1175,7 @@ mod tests {
             ("/Applications/Xcode.app".into(), "Xcode".into(), now - 86400 * 10), // 10 days old
             ("/tmp/zxqwerty.txt".into(), "zxqwerty".into(), now - 60),             // 1 min old, irrelevant
         ]);
-        let scored = idx.query("xco", 10);
+        let scored = idx.query("xco", 10, true);
         // Xcode matches "xco" (prefix), zxqwerty does not — Xcode must rank first
         // regardless of recency
         assert_eq!(scored[0].doc_id, 0);
@@ -1156,7 +1189,7 @@ mod tests {
             ("/c/documentation.pdf".into(), "documentation".into(), 0),
         ]);
         // "xcode doc" should rank xcode_docs.txt first (contains both "xcode" and "doc")
-        let scored = idx.query("xcode doc", 10);
+        let scored = idx.query("xcode doc", 10, true);
         assert_eq!(scored[0].doc_id, 0);
     }
 
@@ -1168,7 +1201,7 @@ mod tests {
             ("/c/notes.txt".into(), "notes".into(), 0),
         ]);
         // "meeting notes" — only doc 0 has both terms
-        let scored = idx.query("meeting notes", 10);
+        let scored = idx.query("meeting notes", 10, true);
         assert!(!scored.is_empty());
         assert_eq!(scored[0].doc_id, 0);
     }
@@ -1180,7 +1213,7 @@ mod tests {
             ("/x/other/lib/main.rs".into(), "main.rs".into(), 0),
         ]);
         // "src main" — first file has "src" in parent dir, should rank higher
-        let scored = idx.query("src main", 10);
+        let scored = idx.query("src main", 10, true);
         assert_eq!(scored[0].doc_id, 0);
     }
 
@@ -1191,7 +1224,7 @@ mod tests {
             ("/b/VideoStreamCapture.app".into(), "VideoStreamCapture".into(), 0),
             ("/c/something_else.app".into(), "SomethingElse".into(), 0),
         ]);
-        let scored = idx.query("vsc", 10);
+        let scored = idx.query("vsc", 10, true);
         assert!(scored.iter().any(|s| s.doc_id == 0));
         assert_eq!(scored[0].doc_id, 0);
     }
@@ -1203,7 +1236,7 @@ mod tests {
             ("/b/internet_photos.txt".into(), "internet_photos".into(), 0),
         ]);
         // "it" matches acronym prefix of "itp" (iTerm2 Preferences)
-        let scored = idx.query("it", 10);
+        let scored = idx.query("it", 10, true);
         assert_eq!(scored[0].doc_id, 0);
     }
 
@@ -1220,7 +1253,7 @@ mod tests {
             ("/Applications/Zoom.app".into(), "Zoom".into(), 0),
             ("/Users/x/Applications/Zoom.app".into(), "Zoom".into(), 0),
         ]);
-        let scored = idx.query("zoom", 10);
+        let scored = idx.query("zoom", 10, true);
         // Both match equally on name; shorter path should win
         assert_eq!(scored[0].doc_id, 0);
     }
@@ -1230,7 +1263,7 @@ mod tests {
         let idx = make_index_with(&[
             ("/a/foo.txt".into(), "foo".into(), 0),
         ]);
-        let scored = idx.query("foo", 10);
+        let scored = idx.query("foo", 10, true);
         assert!(!scored.is_empty());
         let result = idx.to_result(&scored[0]);
         assert!(result.score >= 0.0 && result.score <= 1.0,
@@ -1323,7 +1356,7 @@ mod tests {
         idx.remove(std::path::Path::new("/c/bar.txt"));
 
         assert_eq!(idx.active_doc_count, 2);
-        let results = idx.query("foo", 10);
+        let results = idx.query("foo", 10, true);
         assert!(!results.is_empty());
     }
 
@@ -1403,7 +1436,7 @@ mod tests {
     fn test_index_content_makes_body_searchable() {
         let mut idx = make_index_with(&[("/a/photo.png".into(), "photo.png".into(), 0)]);
         idx.index_content("/a/photo.png", "starbucks receipt 2024");
-        let results = idx.query("starbucks", 10);
+        let results = idx.query("starbucks", 10, true);
         assert!(!results.is_empty(), "body text should be searchable after index_content");
         assert_eq!(results[0].doc_id, 0);
     }
@@ -1420,8 +1453,8 @@ mod tests {
         let mut idx = make_index_with(&[("/a/img.png".into(), "img.png".into(), 0)]);
         idx.index_content("/a/img.png", "old body coffee");
         idx.index_content("/a/img.png", "new body matcha");
-        let coffee = idx.query("coffee", 10);
-        let matcha = idx.query("matcha", 10);
+        let coffee = idx.query("coffee", 10, true);
+        let matcha = idx.query("matcha", 10, true);
         assert!(matcha.len() >= coffee.len(),
             "new body should replace old: coffee={}, matcha={}", coffee.len(), matcha.len());
     }

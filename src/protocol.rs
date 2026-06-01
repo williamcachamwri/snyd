@@ -33,6 +33,13 @@ pub struct SearchRequest {
     /// Payload for command "index_content" — empty for normal search requests.
     #[serde(default)]
     pub content_batch: Vec<ContentEntry>,
+    /// Enable fuzzy fallback when trigram intersection returns few candidates.
+    #[serde(default = "default_true")]
+    pub fuzzy: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Individual search result.
