@@ -12,11 +12,39 @@ A fast trigram-indexed file search daemon with fuzzy matching, real-time filesys
 - **Persistent cache** — bincode-encoded index with 24-hour TTL for instant restarts
 - **JSON-RPC line protocol** — speak to the daemon over a Unix domain socket
 
+## Architecture
+
+```mermaid
+graph LR
+    Client[Client<br/>Swift/Rust/CLI] -->|JSON line over<br/>Unix socket| Daemon[snyd Daemon]
+    Daemon --> Trigram[Trigram Index<br/>Inverted Index]
+    Daemon --> AppCache[App Cache<br/>/Applications]
+    Daemon --> Spotlight[Spotlight Fallback<br/>mdfind]
+    Trigram --> Scoring[BM25 + Fuzzy<br/>Jaro-Winkler]
+    Scoring --> Results[Ranked Results]
+    AppCache --> Results
+    Spotlight --> Results
+    
+    style Daemon fill:#4a90d9,stroke:#2c5aa0,color:#fff
+    style Trigram fill:#5cb85c,stroke:#4cae4c,color:#fff
+    style Scoring fill:#f0ad4e,stroke:#ec971f,color:#fff
+    style Results fill:#d9534f,stroke:#c9302c,color:#fff
+```
+
 ## Benchmarks
 
 All numbers measured on Apple M1 Pro, macOS 14, release build.
 
 ### Index Build Speed
+
+```mermaid
+xychart-beta
+    title "Index Build Speed (lower is better)"
+    x-axis ["1,000 files", "10,000 files", "50,000 files"]
+    y-axis "Time (ms)" 0 --> 450
+    bar [8.35, 76.9, 401]
+    line [8.35, 76.9, 401]
+```
 
 | Corpus Size | Time | Throughput |
 |-------------|------|------------|
@@ -25,6 +53,14 @@ All numbers measured on Apple M1 Pro, macOS 14, release build.
 | 50,000 files | **401 ms** | ~125K files/sec |
 
 ### Search Latency (100,000-file corpus)
+
+```mermaid
+xychart-beta
+    title "Search Latency by Query Type (lower is better)"
+    x-axis ["document_500", "report", "document_99999", "bdgt", "budge", "budget_25000", "2024"]
+    y-axis "Latency (ms)" 0 --> 40
+    bar [15.9, 33.2, 5.2, 20.4, 4.7, 22.9, 12.9]
+```
 
 | Query Type | Query | Latency | Notes |
 |------------|-------|---------|-------|
@@ -38,6 +74,16 @@ All numbers measured on Apple M1 Pro, macOS 14, release build.
 
 ### Head-to-Head: snyd vs find vs Spotlight (100,000 files)
 
+```mermaid
+xychart-beta
+    title "snyd vs find vs mdfind (lower is better)"
+    x-axis ["budget", "bdgt", "file_50000"]
+    y-axis "Latency (ms)" 0 --> 350
+    bar snyd [49.7, 31.6, 13.7]
+    bar find [19.0, 309.8, 256.0]
+    bar mdfind [242.3, 59.5, 60.0]
+```
+
 | Query | snyd | `find` | `mdfind` | Winner |
 |-------|------|--------|----------|--------|
 | `budget` (exact) | **49.7 ms** | 19.0 ms | 242.3 ms | find (linear scan wins on short exact) |
@@ -45,6 +91,28 @@ All numbers measured on Apple M1 Pro, macOS 14, release build.
 | `file_50000` (specific) | **13.7 ms** | 256.0 ms | 60.0 ms | **snyd** (4–19× faster) |
 
 **Key takeaway:** snyd dominates on fuzzy and specific queries. `find` is faster only on very short exact substring scans because it does a simple linear name match without ranking. On anything requiring fuzzy logic or deep specificity, snyd is 4–10× faster than `find` and 2–18× faster than Spotlight.
+
+### How the Trigram Index Works
+
+```mermaid
+graph TD
+    subgraph "Indexing"
+        A[Filename: budget_report_2024.txt] -->|Extract trigrams| B["bud, udg, dge, get, rep, epo, por, 202, 024"]
+        B -->|Map each trigram| C[Inverted Index]
+        C --> D["bud → [doc1, doc2, doc5]"]
+        C --> E["get → [doc1, doc7]"]
+    end
+    
+    subgraph "Query: bdgt"
+        F[Query] -->|Extract trigrams| G["bdg, dgt"]
+        G -->|Intersect posting lists| H[Candidate docs]
+        H -->|Fuzzy score| I[Ranked results]
+    end
+    
+    style A fill:#5bc0de,stroke:#46b8da,color:#fff
+    style F fill:#d9534f,stroke:#c9302c,color:#fff
+    style I fill:#5cb85c,stroke:#4cae4c,color:#fff
+```
 
 ## Quick Start
 
@@ -143,32 +211,28 @@ async fn main() {
 }
 ```
 
-## Architecture
+## Search Pipeline
 
-```
-┌─────────────┐     JSON line     ┌──────────────┐
-│   Client    │◄──► Unix socket   │     snyd     │
-│ (Swift/Rust)│                   │              │
-└─────────────┘                   │  ┌────────┐  │
-                                  │  │Trigram │  │
-                                  │  │ Index  │  │
-                                  │  └────────┘  │
-                                  │       │      │
-                                  │  ┌────────┐  │
-                                  │  │AppCache│  │
-                                  │  └────────┘  │
-                                  │       │      │
-                                  │  ┌────────┐  │
-                                  │  │Spotlight│  │
-                                  │  │Fallback│  │
-                                  │  └────────┘  │
-                                  └──────────────┘
-```
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Daemon as snyd Daemon
+    participant Index as Trigram Index
+    participant Cache as App Cache
+    participant Spotlight as Spotlight Fallback
 
-- **Trigram Index**: Every filename is decomposed into overlapping 3-character sequences (e.g. `budget` → `bud`, `udg`, `dge`, `get`). A query is intersected against these trigrams to find candidates in O(1) per trigram, then scored with BM25 + fuzzy Jaro-Winkler.
-- **AppCache**: Pre-built list of `/Applications/*.app` bundles with fuzzy scoring for instant launcher-style search.
-- **Spotlight Fallback**: When the trigram index returns < 5 results, snyd spawns `mdfind` as a fallback (timeout 800ms).
-- **File Watcher**: `notify` watches all scope directories. File creation/update/deletion triggers an incremental index update and periodic cache save.
+    Client->>Daemon: JSON request (query, max_results)
+    Daemon->>Index: Extract trigrams from query
+    Index->>Daemon: Candidate doc IDs
+    Daemon->>Daemon: BM25 + Fuzzy scoring
+    alt Results < 5
+        Daemon->>Spotlight: mdfind fallback
+        Spotlight->>Daemon: Additional results
+    end
+    Daemon->>Cache: Check app cache (if app query)
+    Cache->>Daemon: App matches
+    Daemon->>Client: Stream batches (done: true last)
+```
 
 ## License
 
