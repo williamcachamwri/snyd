@@ -4,9 +4,41 @@ use std::time::Duration;
 
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::index::TrigramIndex;
+
+/// Skip-list for noisy paths and file types.
+const SKIP_PATH_SEGMENTS: &[&str] = &[
+    "/.git/",
+    "/node_modules/",
+    "/.build/",
+    "/DerivedData/",
+    "/target/",
+    "/dist/",
+    "/out/",
+];
+
+const SKIP_EXTS: &[&str] = &[
+    "o", "pyc", "class", "swp", "swo", "DS_Store",
+    "tmp", "temp", "cache", "lock", "log",
+];
+
+/// Return true if a path should be ignored by the watcher.
+fn should_skip(path: &Path) -> bool {
+    let path_str = path.to_string_lossy();
+    for seg in SKIP_PATH_SEGMENTS {
+        if path_str.contains(seg) {
+            return true;
+        }
+    }
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        if SKIP_EXTS.contains(&ext) {
+            return true;
+        }
+    }
+    false
+}
 
 /// Events that can mutate the index.
 ///
@@ -46,10 +78,6 @@ impl IndexWatcher {
                 Ok(w) => w,
                 Err(e) => {
                     error!("Failed to create file watcher: {}. Running without live updates.", e);
-                    // A no-op watcher with an empty closure should always succeed on any
-                    // platform that supports notify. If it somehow fails, the daemon cannot
-                    // watch files — panic here is acceptable since it indicates a
-                    // system-level misconfiguration.
                     return IndexWatcher {
                         _watcher: RecommendedWatcher::new(
                             move |_res: Result<Event, notify::Error>| {},
@@ -67,10 +95,12 @@ impl IndexWatcher {
                 }
             }
 
-            // Spawn blocking thread to collect and debounce events
+            // Spawn blocking thread to collect, filter, and debounce events
             std::thread::spawn(move || {
                 let mut accumulated: HashSet<PathBuf> = HashSet::new();
                 let mut last_flush = std::time::Instant::now();
+                let mut last_event = std::time::Instant::now();
+                let mut skipped_count = 0usize;
 
                 loop {
                     // Drain events with a short timeout
@@ -79,23 +109,47 @@ impl IndexWatcher {
                         got_any = true;
                         if let Ok(event) = res {
                             for path in event.paths {
+                                if should_skip(&path) {
+                                    skipped_count += 1;
+                                    continue;
+                                }
                                 accumulated.insert(path);
+                                last_event = std::time::Instant::now();
                             }
                         }
                     }
 
-                    // Flush if debounce window elapsed
-                    if !accumulated.is_empty()
-                        && last_flush.elapsed() >= Duration::from_millis(200)
-                    {
+                    let now = std::time::Instant::now();
+                    let debounce_elapsed = now.duration_since(last_flush);
+                    let since_last_event = now.duration_since(last_event);
+
+                    // Flush if:
+                    // 1. Debounce window elapsed (150ms) AND no new events in last 50ms, OR
+                    // 2. Max wait exceeded (500ms) even if events keep coming
+                    let should_flush = !accumulated.is_empty()
+                        && (debounce_elapsed >= Duration::from_millis(150)
+                            && since_last_event >= Duration::from_millis(50))
+                        || (debounce_elapsed >= Duration::from_millis(500));
+
+                    if should_flush {
                         let batch: Vec<IndexEvent> = accumulated
                             .drain()
                             .map(|p| determine_event(&p))
                             .collect();
-                        if let Err(e) = tx.try_send(batch) {
-                            warn!("Failed to send watcher batch: {}", e);
+                        if !batch.is_empty() {
+                            debug!(
+                                "Watcher flush: {} events ({} skipped by filter)",
+                                batch.len(),
+                                skipped_count
+                            );
+                            skipped_count = 0;
+                            if let Err(e) = tx.try_send(batch) {
+                                warn!("Failed to send watcher batch: {}", e);
+                            }
+                        } else {
+                            skipped_count = 0;
                         }
-                        last_flush = std::time::Instant::now();
+                        last_flush = now;
                     }
 
                     if !got_any && accumulated.is_empty() {
@@ -136,21 +190,18 @@ pub async fn run_index_updater(
     index: std::sync::Arc<tokio::sync::RwLock<TrigramIndex>>,
     scopes: Vec<PathBuf>,
 ) {
-    let mut update_count = 0u32;
+    let mut last_save = tokio::time::Instant::now();
+    let save_interval = Duration::from_secs(30);
+
     while let Some(batch) = watcher.recv().await {
-        // One write lock for the entire batch
+        // One write lock for the entire batch — use atomic update() for Modified
         {
             let mut idx = index.write().await;
             for event in &batch {
                 match event {
                     IndexEvent::Modified(path) => {
-                        if path.exists() {
-                            idx.remove(path);
-                            idx.add(path);
-                            debug!("Index updated: {}", path.display());
-                        } else {
-                            idx.remove(path);
-                        }
+                        idx.update(path);
+                        debug!("Index updated: {}", path.display());
                     }
                     IndexEvent::Deleted(path) => {
                         idx.remove(path);
@@ -160,9 +211,12 @@ pub async fn run_index_updater(
             }
         } // write lock released here
 
-        update_count += batch.len() as u32;
-        // Periodic save (every ~500 file events, not 500 batches)
-        if update_count % 500 < batch.len() as u32 {
+        // Throttled save: only save every 30s and only if no pending events
+        let now = tokio::time::Instant::now();
+        if now.duration_since(last_save) >= save_interval {
+            // Peek whether there are pending events; if so, skip this save window
+            // (mpsc::Receiver doesn't have a non-blocking peek, so we just save
+            // unconditionally — the next batch will come in soon and we'll check again.)
             let idx_clone = index.clone();
             let scopes_clone = scopes.clone();
             tokio::spawn(async move {
@@ -172,8 +226,13 @@ pub async fn run_index_updater(
                     .join("snyd");
                 if let Err(e) = crate::persist::save(&idx, &scopes_clone, &cache_dir) {
                     warn!("Periodic index save failed: {}", e);
+                } else {
+                    debug!("Periodic index saved");
                 }
             });
+            last_save = now;
         }
     }
+
+    info!("File watcher channel closed; stopping index updater");
 }

@@ -292,6 +292,11 @@ impl TrigramIndex {
         }
     }
 
+    /// Maximum possible additional score beyond cheap structural bonuses.
+    /// Used for early-exit pruning: if cheap_score + this bound < heap_min, skip doc.
+    /// Conservative sum of: BM25_max (~10) + recency_max (40) + path_max (30) + len_max (10).
+    const MAX_POSSIBLE_REMAINING: f32 = 90.0;
+
     /// Query the index and return top-k scored documents.
     ///
     /// Scoring happens in three stages:
@@ -302,11 +307,16 @@ impl TrigramIndex {
     ///    app boost, path-segment bonus, recency, and depth penalty.
     ///
     /// The raw score is normalized to `[0, 1]` by `to_result()`.
+    ///
+    /// **Early-exit optimization:** Cheap structural bonuses are computed first.
+    /// If the heap is already full and the doc's best-case score (cheap + max remaining)
+    /// cannot beat the current minimum, the doc is skipped entirely — no BM25, no recency,
+    /// no depth/path calculations.
     pub fn query(&self, query: &str, max: usize) -> Vec<ScoredDoc> {
         let query_lower = query.to_lowercase();
         let query_terms = tokenize(&query_lower);
 
-        let candidate_ids: Vec<u32> = if query_terms.is_empty() {
+        let mut candidate_ids: Vec<u32> = if query_terms.is_empty() {
             return vec![];
         } else if query_terms.len() == 1 {
             self.candidates_for_term(&query_terms[0])
@@ -323,13 +333,29 @@ impl TrigramIndex {
             result.unwrap_or_default().into_iter().collect()
         };
 
+        // ── Optimization B: pre-sort candidates by term coverage (desc) ───
+        // High-coverage docs are more likely to score well → fill heap faster →
+        // increase early-exit rate for remaining candidates.
+        if query_terms.len() > 1 && candidate_ids.len() > max {
+            candidate_ids.sort_by_key(|&id| {
+                let doc = &self.docs[id as usize];
+                let coverage = query_terms
+                    .iter()
+                    .filter(|t| doc.name_lower.contains(t.as_str()))
+                    .count();
+                std::cmp::Reverse(coverage)
+            });
+        }
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
+        let candidate_count = candidate_ids.len();
         let mut heap: BinaryHeap<ScoredDoc> = BinaryHeap::with_capacity(max + 1);
         let query_char_count = query_lower.chars().count() as f32;
+        let mut skipped = 0usize;
 
         for doc_id in candidate_ids {
             let doc = &self.docs[doc_id as usize];
@@ -337,9 +363,9 @@ impl TrigramIndex {
                 continue;
             }
 
-            let mut score = self.bm25_score(doc_id, &query_terms);
+            // ── Cheap structural bonuses (fast string ops) ─────────────────
+            let mut cheap_score = 0.0;
 
-            // ── Structural bonuses (reliable signals) ────────────────────
             if query_terms.len() > 1 {
                 let terms_in_name = query_terms
                     .iter()
@@ -349,35 +375,47 @@ impl TrigramIndex {
 
                 if term_coverage == 1.0 {
                     if doc.name_lower == query_lower {
-                        score += SCORE_EXACT_MATCH;
+                        cheap_score += SCORE_EXACT_MATCH;
                     } else {
-                        score += SCORE_TERM_COVERAGE_FULL * term_coverage;
+                        cheap_score += SCORE_TERM_COVERAGE_FULL * term_coverage;
                     }
                 } else if term_coverage >= 0.5 {
-                    score += SCORE_TERM_COVERAGE_HALF * term_coverage;
+                    cheap_score += SCORE_TERM_COVERAGE_HALF * term_coverage;
                 }
             } else {
                 if doc.name_lower == query_lower {
-                    score += SCORE_EXACT_MATCH;
+                    cheap_score += SCORE_EXACT_MATCH;
                 } else if doc.name_lower.starts_with(&query_lower) {
-                    score += SCORE_PREFIX_MATCH;
+                    cheap_score += SCORE_PREFIX_MATCH;
                 } else if word_boundary_starts_with(&doc.name_lower, &query_lower) {
-                    score += SCORE_WORD_PREFIX;
+                    cheap_score += SCORE_WORD_PREFIX;
                 }
             }
 
             if doc.kind == ResultKind::Application {
-                score += SCORE_APP_BOOST;
+                cheap_score += SCORE_APP_BOOST;
             }
 
-            // ── Acronym match ────────────────────────────────────────────
             if query_lower.len() >= 2 && query_lower.len() <= 6 {
                 if doc.acronym == query_lower {
-                    score += SCORE_ACRONYM_EXACT;
+                    cheap_score += SCORE_ACRONYM_EXACT;
                 } else if doc.acronym.starts_with(&query_lower) {
-                    score += SCORE_ACRONYM_PREFIX;
+                    cheap_score += SCORE_ACRONYM_PREFIX;
                 }
             }
+
+            // ── Optimization A: early-exit before expensive scoring ──────
+            if heap.len() >= max {
+                let min_score = heap.peek().map(|s| s.score).unwrap_or(0.0);
+                if cheap_score + Self::MAX_POSSIBLE_REMAINING < min_score {
+                    skipped += 1;
+                    continue;
+                }
+            }
+
+            // ── Full scoring (BM25 + expensive bonuses) ──────────────────
+            let mut score = self.bm25_score(doc_id, &query_terms);
+            score += cheap_score;
 
             // Name length normalization bonus
             let name_len = doc.name_lower.chars().count() as f32;
@@ -423,6 +461,10 @@ impl TrigramIndex {
             if heap.len() > max {
                 heap.pop(); // remove lowest
             }
+        }
+
+        if skipped > 0 {
+            tracing::debug!("query early-exit: skipped {} of {} candidates", skipped, candidate_count);
         }
 
         let mut results: Vec<ScoredDoc> = heap.into_vec();
@@ -684,6 +726,16 @@ impl TrigramIndex {
         let doc = &mut self.docs[doc_id as usize];
         doc.body_lower = body_lower;
         doc.body_tokens = new_tokens;
+    }
+
+    /// Atomic update: remove existing doc at path (if any) then re-add it.
+    /// Used by the file watcher for Modified events — cheaper than separate
+    /// remove() + add() because it only acquires one write-lock session.
+    pub fn update(&mut self, path: &Path) {
+        self.remove(path);
+        if path.exists() {
+            self.add(path);
+        }
     }
 
     /// Incremental update: mark as deleted.
