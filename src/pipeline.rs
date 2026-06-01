@@ -214,6 +214,15 @@ impl SearchPipeline {
             let phase1_count = index_results.len();
             if !index_results.is_empty() {
                 total_yielded += index_results.len();
+                // Record access for top-3 results (frequency boost for future searches)
+                let access_paths: Vec<String> = index_results.iter().take(3).map(|r| r.path.clone()).collect();
+                let idx_for_access = index.clone();
+                tokio::spawn(async move {
+                    let mut idx = idx_for_access.write().await;
+                    for path in &access_paths {
+                        idx.record_access(path);
+                    }
+                });
                 let _ = tx
                     .send(SearchBatch {
                         id: id.clone(),

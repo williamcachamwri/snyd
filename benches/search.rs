@@ -45,18 +45,28 @@ fn generate_corpus(n: usize) -> Vec<(String, String, u64)> {
 fn build_index_from_corpus(corpus: &[(String, String, u64)]) -> TrigramIndex {
     let docs: Vec<DocEntry> = corpus
         .iter()
-        .map(|(path, name, mtime)| DocEntry {
-            path: path.clone(),
-            name_lower: name.to_lowercase(),
-            path_dir_lower: String::new(),
-            acronym: String::new(),
-            tokens: Vec::new(),
-            body_lower: String::new(),
-            body_tokens: Vec::new(),
-            kind: snyd::protocol::ResultKind::File,
-            mtime: *mtime,
-            size: 1024,
-            deleted: false,
+        .map(|(path, name, mtime)| {
+            let extension = std::path::Path::new(path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            DocEntry {
+                path: path.clone(),
+                name_lower: name.to_lowercase(),
+                path_dir_lower: String::new(),
+                acronym: String::new(),
+                tokens: Vec::new(),
+                body_lower: String::new(),
+                body_tokens: Vec::new(),
+                kind: snyd::protocol::ResultKind::File,
+                mtime: *mtime,
+                size: 1024,
+                deleted: false,
+                extension,
+                access_count: 0,
+                last_accessed: 0,
+            }
         })
         .collect();
     TrigramIndex::from_docs(docs)

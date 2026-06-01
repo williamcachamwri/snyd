@@ -64,6 +64,12 @@ pub struct DocEntry {
     pub mtime: u64,
     pub size: u64,
     pub deleted: bool,
+    /// File extension without the leading dot, lowercase (e.g. "pdf", "rs", "").
+    pub extension: String,
+    /// Number of times this doc appeared in search results (for frequency boost).
+    pub access_count: u32,
+    /// Unix timestamp of the last access.
+    pub last_accessed: u64,
 }
 
 /// In-memory trigram index.
@@ -212,6 +218,12 @@ impl TrigramIndex {
                     break 'outer;
                 }
 
+                let extension = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+
                 docs.push(DocEntry {
                     path: path_str,
                     name_lower,
@@ -224,6 +236,9 @@ impl TrigramIndex {
                     mtime,
                     size,
                     deleted: false,
+                    extension,
+                    access_count: 0,
+                    last_accessed: 0,
                 });
             }
         }
@@ -357,6 +372,11 @@ impl TrigramIndex {
         let query_char_count = query_lower.chars().count() as f32;
         let mut skipped = 0usize;
 
+        // Extract extension from query (e.g. "report.pdf" → "pdf")
+        let query_ext = query_lower.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+        // Extract stem from query (e.g. "report.pdf" → "report")
+        let query_stem = query_lower.rsplit_once('.').map(|(s, _)| s).unwrap_or(&query_lower);
+
         for doc_id in candidate_ids {
             let doc = &self.docs[doc_id as usize];
             if doc.deleted {
@@ -404,6 +424,18 @@ impl TrigramIndex {
                 }
             }
 
+            // Extension-aware boost
+            if !query_ext.is_empty() && doc.extension == query_ext {
+                cheap_score += 80.0;
+            }
+            // Stem exact-match boost
+            if !query_stem.is_empty() {
+                let doc_stem = doc.name_lower.rsplit_once('.').map(|(s, _)| s).unwrap_or(&doc.name_lower);
+                if doc_stem == query_stem {
+                    cheap_score += 30.0;
+                }
+            }
+
             // ── Optimization A: early-exit before expensive scoring ──────
             if heap.len() >= max {
                 let min_score = heap.peek().map(|s| s.score).unwrap_or(0.0);
@@ -441,6 +473,14 @@ impl TrigramIndex {
                 0.0
             };
             score += recency_bonus;
+
+            // ── Access frequency boost (logarithmic to avoid over-domination) ─
+            let freq_boost = if doc.access_count > 0 {
+                (doc.access_count as f32).ln() * 5.0
+            } else {
+                0.0
+            };
+            score += freq_boost;
 
             // ── Depth penalty: softer, max 10 pts ───────────────────────────
             let path_depth = doc.path.matches('/').count() as f32;
@@ -646,6 +686,11 @@ impl TrigramIndex {
             .map(|p| p.to_string_lossy().to_lowercase())
             .unwrap_or_default();
         let acronym = extract_acronym(&name_lower);
+        let extension = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
 
         let doc_id = self.docs.len() as u32;
         self.docs.push(DocEntry {
@@ -660,6 +705,9 @@ impl TrigramIndex {
             mtime,
             size,
             deleted: false,
+            extension,
+            access_count: 0,
+            last_accessed: 0,
         });
         self.path_to_id.insert(path_str, doc_id);
 
@@ -735,6 +783,19 @@ impl TrigramIndex {
         self.remove(path);
         if path.exists() {
             self.add(path);
+        }
+    }
+
+    /// Record that a document was returned in search results.
+    /// Increments access_count and updates last_accessed timestamp.
+    pub fn record_access(&mut self, path: &str) {
+        if let Some(&doc_id) = self.path_to_id.get(path) {
+            let doc = &mut self.docs[doc_id as usize];
+            doc.access_count = doc.access_count.saturating_add(1);
+            doc.last_accessed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
         }
     }
 
@@ -976,6 +1037,11 @@ mod tests {
                 }
             }
             let doc_id = index.docs.len() as u32;
+            let extension = Path::new(path.as_str())
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
             index.docs.push(DocEntry {
                 path: path.clone(),
                 name_lower: name_lower.clone(),
@@ -988,6 +1054,9 @@ mod tests {
                 mtime: *mtime,
                 size: 0,
                 deleted: false,
+                extension,
+                access_count: 0,
+                last_accessed: 0,
             });
             index.path_to_id.insert(path.clone(), doc_id);
             let trigrams = extract_trigrams(&name_lower);

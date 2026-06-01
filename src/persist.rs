@@ -32,6 +32,9 @@ struct SerialDoc {
     kind: ResultKind,
     mtime: u64,
     size: u64,
+    extension: String,
+    access_count: u32,
+    last_accessed: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -119,6 +122,9 @@ pub fn save(index: &TrigramIndex, scopes: &[PathBuf], cache_dir: &std::path::Pat
             kind: d.kind,
             mtime: d.mtime,
             size: d.size,
+            extension: d.extension.clone(),
+            access_count: d.access_count,
+            last_accessed: d.last_accessed,
         })
         .collect();
 
@@ -166,6 +172,9 @@ pub fn load(_scopes: &[PathBuf], cache_dir: &std::path::Path) -> Option<TrigramI
             mtime: d.mtime,
             size: d.size,
             deleted: false,
+            extension: d.extension,
+            access_count: d.access_count,
+            last_accessed: d.last_accessed,
         })
         .collect();
 
