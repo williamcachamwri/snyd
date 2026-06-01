@@ -116,7 +116,7 @@ xychart-beta
 
 ### Memory Efficiency
 
-| Metric | Before | After (Prompt 10) | Saving |
+| Metric | Before | After | Saving |
 |--------|--------|---------------------|--------|
 | `DocEntry` per doc | ~200 bytes | ~120 bytes | **~40%** |
 | Token storage | `Vec<String>` | `SmallVec<[Arc<str>; 4]>` | No heap alloc for ≤ 4 tokens |
