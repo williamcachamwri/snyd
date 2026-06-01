@@ -132,8 +132,16 @@ snyd -s /tmp/my-snyd.sock -d /data
 
 ## Installation
 
+From [crates.io](https://crates.io/crates/snyd):
+
 ```bash
-cargo install --path .
+cargo install snyd
+```
+
+Or with a specific version:
+
+```bash
+cargo install snyd --version 0.2.0
 ```
 
 Or build from source:
