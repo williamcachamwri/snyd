@@ -194,15 +194,15 @@ mod tests {
         let doc_count = idx.docs.len();
         assert!(doc_count > 0);
 
-        save(&idx, &[dir.clone()]).unwrap();
+        let cache_dir = std::env::temp_dir().join("snyd_test_cache");
+        save(&idx, &[dir.clone()], &cache_dir).unwrap();
 
-        let loaded = load(&[dir.clone()]).expect("should load successfully");
+        let loaded = load(&[dir.clone()], &cache_dir).expect("should load successfully");
         assert_eq!(loaded.docs.len(), doc_count);
         assert_eq!(loaded.tombstone_count, 0);
 
         // Cleanup
-        let cache = cache_path();
-        let _ = std::fs::remove_file(&cache);
+        let _ = std::fs::remove_dir_all(&cache_dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -210,12 +210,14 @@ mod tests {
     fn test_stale_cache_returns_none() {
         let _guard = CACHE_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join("snyd_test_stale");
+        let cache_dir = std::env::temp_dir().join("snyd_test_stale_cache");
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cache_dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "test").unwrap();
 
         let idx = TrigramIndex::build(&[dir.clone()]);
-        save(&idx, &[dir.clone()]).unwrap();
+        save(&idx, &[dir.clone()], &cache_dir).unwrap();
 
         // Sleep 1.1s so any filesystem touch will definitely advance mtime
         std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -225,17 +227,19 @@ mod tests {
         std::fs::write(dir.join("b.txt"), "touch").unwrap();
 
         // Now load should see the scope as stale
-        assert!(load(&[dir.clone()]).is_none());
+        assert!(load(&[dir.clone()], &cache_dir).is_none());
 
         // Cleanup
-        let cache = cache_path();
-        let _ = std::fs::remove_file(&cache);
+        let _ = std::fs::remove_dir_all(&cache_dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_version_mismatch_returns_none() {
         let _guard = CACHE_LOCK.lock().unwrap();
+        let cache_dir = std::env::temp_dir().join("snyd_test_version");
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
         let bad = CacheFile {
             header: CacheHeader {
                 version: 0, // wrong version
@@ -245,10 +249,10 @@ mod tests {
             docs: vec![],
         };
         let encoded = bincode::serialize(&bad).unwrap();
-        let cache = cache_path();
+        let cache = cache_path(&cache_dir);
         std::fs::write(&cache, encoded).unwrap();
 
-        assert!(load(&[]).is_none());
+        assert!(load(&[], &cache_dir).is_none());
 
         // Cleanup
         let _ = std::fs::remove_file(&cache);
@@ -258,30 +262,31 @@ mod tests {
     fn test_cache_expires_after_24h() {
         let _guard = CACHE_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join("snyd_test_expire");
+        let cache_dir = std::env::temp_dir().join("snyd_test_expire_cache");
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cache_dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "test").unwrap();
 
         let idx = TrigramIndex::build(&[dir.clone()]);
-        save(&idx, &[dir.clone()]).unwrap();
+        save(&idx, &[dir.clone()], &cache_dir).unwrap();
 
         // Validate the safety-net constant exists in a reasonable range.
         assert!(MAX_CACHE_AGE_SECS <= 86_400 * 7, "Cache max age should be <= 7 days");
         assert!(MAX_CACHE_AGE_SECS >= 3_600, "Cache max age should be >= 1 hour");
 
         // Cleanup
-        let cache = cache_path();
-        let _ = std::fs::remove_file(&cache);
+        let _ = std::fs::remove_dir_all(&cache_dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_cache_path_is_user_specific() {
-        let path = cache_path();
-        let home = std::env::var("HOME").unwrap_or_default();
+        let cache_dir = std::env::temp_dir().join("snyd_test_path");
+        let path = cache_path(&cache_dir);
         assert!(
-            path.to_string_lossy().contains(&home) || path.starts_with("/tmp"),
-            "Cache path should be under $HOME, got: {:?}",
+            path.to_string_lossy().contains("snyd_test_path"),
+            "Cache path should contain cache_dir name, got: {:?}",
             path
         );
     }
