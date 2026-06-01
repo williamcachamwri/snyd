@@ -282,71 +282,233 @@ fn bench_regression_guard(c: &mut Criterion) {
 // If any benchmark exceeds 2× these ranges, investigate before merging.
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 6. HEAD-TO-HEAD: snyd vs find vs mdfind
+// 6. HEAD-TO-HEAD: snyd vs find vs mdfind (comprehensive)
 // ═════════════════════════════════════════════════════════════════════════════
 
-fn bench_head_to_head(c: &mut Criterion) {
-    let dir = std::env::temp_dir().join("snyd_bench_head_to_head");
+fn setup_head_to_head_dir(size: usize) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("snyd_bench_head_to_head_{}", size));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    // Create 10,000 real files for find/mdfind
-    for i in 0..10_000usize {
-        let name = if i % 3 == 0 {
-            format!("budget_report_{:05}.xlsx", i)
+    let names = [
+        ("budget", "report", "xlsx"),
+        ("meeting", "notes", "docx"),
+        ("MyReact", "Component", "tsx"),
+        ("User", "Controller", "java"),
+        ("image", "001", "png"),
+        ("photo", "20240315", "jpg"),
+        ("README", "", "md"),
+        ("package", "", "json"),
+        ("Cargo", "", "toml"),
+        ("main", "", "rs"),
+        ("index", "", "html"),
+        ("styles", "", "css"),
+        ("app", "", "swift"),
+        ("server", "config", "yaml"),
+        ("test", "spec", "js"),
+    ];
+
+    for i in 0..size {
+        let (a, b, ext) = names[i % names.len()];
+        let name = if b.is_empty() {
+            format!("{}_{:05}.{}", a, i, ext)
         } else {
-            format!("other_file_{:05}.txt", i)
+            format!("{}_{}_{:05}.{}", a, b, i, ext)
         };
         std::fs::write(dir.join(&name), "test").unwrap();
     }
+    dir
+}
 
-    let index = TrigramIndex::build(&[dir.clone()]);
+fn bench_head_to_head(c: &mut Criterion) {
+    for size in [1_000usize, 10_000usize] {
+        let dir = setup_head_to_head_dir(size);
+        let index = TrigramIndex::build(&[dir.clone()]);
 
-    let mut group = c.benchmark_group("head_to_head");
-    group.sample_size(20);
-    group.measurement_time(std::time::Duration::from_secs(5));
+        let mut group = c.benchmark_group(format!("head_to_head_{}K", size / 1000));
+        group.sample_size(20);
+        group.measurement_time(std::time::Duration::from_secs(5));
 
-    // snyd — direct index query (fastest path)
-    group.bench_function("snyd_budget", |b| {
-        b.iter(|| {
-            let _results = black_box(index.query("budget", 20, true));
-        })
-    });
+        // ── Exact match ──────────────────────────────────────────────────
+        group.bench_function(format!("snyd_exact/{}", size), |b| {
+            b.iter(|| {
+                let _results = black_box(index.query("budget_report_00000.xlsx", 20, true));
+            })
+        });
 
-    // find — BSD/GNU compatible
-    group.bench_function("find_budget", |b| {
-        b.iter(|| {
-            let output = std::process::Command::new("find")
-                .arg(&dir)
-                .arg("-name")
-                .arg("*budget*")
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .unwrap();
-            black_box(output.stdout.len());
-        })
-    });
+        group.bench_function(format!("find_exact/{}", size), |b| {
+            b.iter(|| {
+                let output = std::process::Command::new("find")
+                    .arg(&dir)
+                    .arg("-name")
+                    .arg("budget_report_00000.xlsx")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .unwrap();
+                black_box(output.stdout.len());
+            })
+        });
 
-    // mdfind — may return empty for temp dirs (Spotlight indexing lag)
-    group.bench_function("mdfind_budget", |b| {
-        b.iter(|| {
-            let output = std::process::Command::new("mdfind")
-                .arg("-onlyin")
-                .arg(&dir)
-                .arg("kMDItemDisplayName == '*budget*'cd")
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .unwrap();
-            black_box(output.stdout.len());
-        })
-    });
+        group.bench_function(format!("mdfind_exact/{}", size), |b| {
+            b.iter(|| {
+                let output = std::process::Command::new("mdfind")
+                    .arg("-onlyin")
+                    .arg(&dir)
+                    .arg("kMDItemDisplayName == 'budget_report_00000.xlsx'cd")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .unwrap();
+                black_box(output.stdout.len());
+            })
+        });
 
-    group.finish();
+        // ── Prefix match ─────────────────────────────────────────────────
+        group.bench_function(format!("snyd_prefix/{}", size), |b| {
+            b.iter(|| {
+                let _results = black_box(index.query("budget", 20, true));
+            })
+        });
 
-    // Cleanup
-    let _ = std::fs::remove_dir_all(&dir);
+        group.bench_function(format!("find_prefix/{}", size), |b| {
+            b.iter(|| {
+                let output = std::process::Command::new("find")
+                    .arg(&dir)
+                    .arg("-name")
+                    .arg("*budget*")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .unwrap();
+                black_box(output.stdout.len());
+            })
+        });
+
+        group.bench_function(format!("mdfind_prefix/{}", size), |b| {
+            b.iter(|| {
+                let output = std::process::Command::new("mdfind")
+                    .arg("-onlyin")
+                    .arg(&dir)
+                    .arg("kMDItemDisplayName == '*budget*'cd")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .unwrap();
+                black_box(output.stdout.len());
+            })
+        });
+
+        // ── Fuzzy typo ───────────────────────────────────────────────────
+        group.bench_function(format!("snyd_fuzzy/{}", size), |b| {
+            b.iter(|| {
+                let _results = black_box(index.query("bdgt", 20, true));
+            })
+        });
+
+        group.bench_function(format!("find_fuzzy/{}", size), |b| {
+            b.iter(|| {
+                let output = std::process::Command::new("find")
+                    .arg(&dir)
+                    .arg("-name")
+                    .arg("*bdgt*")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .unwrap();
+                black_box(output.stdout.len());
+            })
+        });
+
+        group.bench_function(format!("mdfind_fuzzy/{}", size), |b| {
+            b.iter(|| {
+                let output = std::process::Command::new("mdfind")
+                    .arg("-onlyin")
+                    .arg(&dir)
+                    .arg("kMDItemDisplayName == '*bdgt*'cd")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .unwrap();
+                black_box(output.stdout.len());
+            })
+        });
+
+        // ── Broad match (high candidate count) ───────────────────────────
+        group.bench_function(format!("snyd_broad/{}", size), |b| {
+            b.iter(|| {
+                let _results = black_box(index.query("report", 20, true));
+            })
+        });
+
+        group.bench_function(format!("find_broad/{}", size), |b| {
+            b.iter(|| {
+                let output = std::process::Command::new("find")
+                    .arg(&dir)
+                    .arg("-name")
+                    .arg("*report*")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .unwrap();
+                black_box(output.stdout.len());
+            })
+        });
+
+        group.bench_function(format!("mdfind_broad/{}", size), |b| {
+            b.iter(|| {
+                let output = std::process::Command::new("mdfind")
+                    .arg("-onlyin")
+                    .arg(&dir)
+                    .arg("kMDItemDisplayName == '*report*'cd")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .unwrap();
+                black_box(output.stdout.len());
+            })
+        });
+
+        // ── Not found ────────────────────────────────────────────────────
+        group.bench_function(format!("snyd_notfound/{}", size), |b| {
+            b.iter(|| {
+                let _results = black_box(index.query("xyznonexistent", 20, true));
+            })
+        });
+
+        group.bench_function(format!("find_notfound/{}", size), |b| {
+            b.iter(|| {
+                let output = std::process::Command::new("find")
+                    .arg(&dir)
+                    .arg("-name")
+                    .arg("*xyznonexistent*")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .unwrap();
+                black_box(output.stdout.len());
+            })
+        });
+
+        group.bench_function(format!("mdfind_notfound/{}", size), |b| {
+            b.iter(|| {
+                let output = std::process::Command::new("mdfind")
+                    .arg("-onlyin")
+                    .arg(&dir)
+                    .arg("kMDItemDisplayName == '*xyznonexistent*'cd")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .unwrap();
+                black_box(output.stdout.len());
+            })
+        });
+
+        group.finish();
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 criterion_group!(

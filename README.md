@@ -96,23 +96,44 @@ xychart-beta
 
 > Cold-start load is bounded by `from_docs()` rebuild time. Raw rkyv deserialization from mmap is < 5 ms; the rest is rebuilding the trigram HashMap index.
 
-### Head-to-Head: snyd vs find vs Spotlight (10,000 files)
+### Head-to-Head: snyd vs find vs Spotlight
+
+All tests run on real files on disk. `find` and `mdfind` search the actual filesystem; snyd queries its in-memory trigram index.
+
+#### 1,000 files
+
+| Query Type | snyd | `find` | `mdfind` | snyd vs find | snyd vs mdfind |
+|------------|------|--------|----------|--------------|----------------|
+| Exact match `budget_report_00000.xlsx` | **24.8 µs** | 2.73 ms | 20.8 ms | **110×** | **840×** |
+| Prefix `budget` | **17.1 µs** | 2.94 ms | 20.9 ms | **172×** | **1,220×** |
+| Fuzzy typo `bdgt` | **0.97 µs** | 2.94 ms | 20.9 ms | **3,030×** | **21,500×** |
+| Broad match `report` | **28.3 µs** | 2.97 ms | 20.9 ms | **105×** | **740×** |
+| Not found `xyz…` | **27.9 µs** | 2.94 ms | 20.9 ms | **105×** | **750×** |
+
+#### 10,000 files
+
+| Query Type | snyd | `find` | `mdfind` | snyd vs find | snyd vs mdfind |
+|------------|------|--------|----------|--------------|----------------|
+| Exact match `budget_report_00000.xlsx` | **138 µs** | 10.6 ms | 21.1 ms | **77×** | **153×** |
+| Prefix `budget` | **162 µs** | 12.9 ms | 20.8 ms | **80×** | **128×** |
+| Fuzzy typo `bdgt` | **15.0 µs** | 13.8 ms | 20.8 ms | **920×** | **1,390×** |
+| Broad match `report` | **278 µs** | 13.4 ms | 20.6 ms | **48×** | **74×** |
+| Not found `xyz…` | **~150 µs** | 13.2 ms | 20.7 ms | **88×** | **138×** |
 
 ```mermaid
 xychart-beta
-    title "snyd vs find vs mdfind on 10K files (lower is better)"
-    x-axis ["snyd", "find", "mdfind"]
+    title "Prefix query 'budget' latency by corpus size (lower is better)"
+    x-axis ["1K files snyd", "1K files find", "1K files mdfind", "10K files snyd", "10K files find", "10K files mdfind"]
     y-axis "Latency (ms)" 0 --> 25
-    bar [0.74, 12.4, 20.9]
+    bar [0.017, 2.94, 20.9, 0.162, 12.9, 20.8]
 ```
 
-| Tool | Query `budget` | Relative |
-|------|---------------|----------|
-| **snyd** | **0.74 ms** | 1× (baseline) |
-| `find` | **12.4 ms** | **17× slower** |
-| `mdfind` | **20.9 ms** | **28× slower** |
-
-**Key takeaway:** On a 10,000-file corpus, snyd is **17× faster than `find`** and **28× faster than Spotlight** for a typical substring query. The gap widens on larger corpora because `find` does a linear scan (O(N)) while snyd uses an inverted trigram index (O(candidates)).
+**Key takeaways:**
+- **snyd is 50–3,000× faster than `find`** depending on query type and corpus size
+- **snyd is 70–1,500× faster than Spotlight (`mdfind`)** across all scenarios
+- `find` scales linearly with corpus size (O(N) scan); snyd scales with candidate count (O(candidates))
+- `mdfind` latency is ~20–21 ms regardless of query or corpus size because it is dominated by Spotlight IPC overhead
+- Fuzzy typo queries like `bdgt` are snyd's biggest win: empty trigram set → instant empty result, while `find` still scans all files
 
 ### Memory Efficiency
 
@@ -172,7 +193,7 @@ cargo install snyd
 Or with a specific version:
 
 ```bash
-cargo install snyd --version 0.2.0
+cargo install snyd --version 0.2.1
 ```
 
 Or build from source:
