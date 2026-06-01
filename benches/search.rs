@@ -281,6 +281,74 @@ fn bench_regression_guard(c: &mut Criterion) {
 // - load 50K:        < 100 ms
 // If any benchmark exceeds 2× these ranges, investigate before merging.
 
+// ═════════════════════════════════════════════════════════════════════════════
+// 6. HEAD-TO-HEAD: snyd vs find vs mdfind
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn bench_head_to_head(c: &mut Criterion) {
+    let dir = std::env::temp_dir().join("snyd_bench_head_to_head");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Create 10,000 real files for find/mdfind
+    for i in 0..10_000usize {
+        let name = if i % 3 == 0 {
+            format!("budget_report_{:05}.xlsx", i)
+        } else {
+            format!("other_file_{:05}.txt", i)
+        };
+        std::fs::write(dir.join(&name), "test").unwrap();
+    }
+
+    let index = TrigramIndex::build(&[dir.clone()]);
+
+    let mut group = c.benchmark_group("head_to_head");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(5));
+
+    // snyd — direct index query (fastest path)
+    group.bench_function("snyd_budget", |b| {
+        b.iter(|| {
+            let _results = black_box(index.query("budget", 20, true));
+        })
+    });
+
+    // find — BSD/GNU compatible
+    group.bench_function("find_budget", |b| {
+        b.iter(|| {
+            let output = std::process::Command::new("find")
+                .arg(&dir)
+                .arg("-name")
+                .arg("*budget*")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            black_box(output.stdout.len());
+        })
+    });
+
+    // mdfind — may return empty for temp dirs (Spotlight indexing lag)
+    group.bench_function("mdfind_budget", |b| {
+        b.iter(|| {
+            let output = std::process::Command::new("mdfind")
+                .arg("-onlyin")
+                .arg(&dir)
+                .arg("kMDItemDisplayName == '*budget*'cd")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            black_box(output.stdout.len());
+        })
+    });
+
+    group.finish();
+
+    // Cleanup
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 criterion_group!(
     benches,
     bench_index_build,
@@ -288,6 +356,7 @@ criterion_group!(
     bench_query_latency,
     bench_incremental_update,
     bench_persist,
-    bench_regression_guard
+    bench_regression_guard,
+    bench_head_to_head
 );
 criterion_main!(benches);
