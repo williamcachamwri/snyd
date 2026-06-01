@@ -6,7 +6,7 @@ authors = ["William Cachamwri <william@snything.app>"]
 description = "A fast trigram-indexed file search daemon with fuzzy matching and real-time filesystem watching"
 license = "MIT"
 repository = "https://github.com/williamcachamwri/snyd"
-keywords = ["search", "filesystem", "index", "trigram", "fuzzy", "daemon"]
+keywords = ["search", "filesystem", "index", "trigram", "fuzzy"]
 categories = ["filesystem", "command-line-utilities"]
 rust-version = "1.75"
 
