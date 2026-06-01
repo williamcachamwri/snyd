@@ -356,8 +356,32 @@ impl TrigramIndex {
     /// If the heap is already full and the doc's best-case score (cheap + max remaining)
     /// cannot beat the current minimum, the doc is skipped entirely — no BM25, no recency,
     /// no depth/path calculations.
+    /// Fast path for extension queries like ".har", ".pdf".
+    fn query_by_extension(&self, ext: &str, max: usize) -> Vec<ScoredDoc> {
+        let mut results: Vec<ScoredDoc> = self
+            .docs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.is_deleted(*i as u32))
+            .filter(|(_, d)| d.extension == ext)
+            .map(|(i, d)| ScoredDoc {
+                doc_id: i as u32,
+                score: 100.0 + (d.access_count as f32).ln() * 5.0,
+            })
+            .collect();
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(max);
+        results
+    }
+
     pub fn query(&self, query: &str, max: usize, fuzzy: bool) -> Vec<ScoredDoc> {
         let query_lower = query.to_lowercase();
+
+        // Extension query fast-path: ".har", ".pdf"
+        if let Some(ext) = query_lower.strip_prefix('.') {
+            return self.query_by_extension(ext, max);
+        }
+
         let query_terms = tokenize(&query_lower);
 
         let mut candidate_ids: Vec<u32> = if query_terms.is_empty() {
@@ -588,11 +612,25 @@ impl TrigramIndex {
     /// For terms with at least 2 trigrams we **intersect** bitmaps (fast O(1) lookup).
     /// Intersection (not union) is used because a doc must contain *all* trigrams
     /// of the term to be a plausible match — this gives higher precision.
-    /// For very short terms we fall back to a bounded scan of the most recent docs.
+    /// For very short terms we fall back to a bounded scan of docs whose name
+    /// actually contains the term, ordered by recency.
     fn candidates_for_term(&self, term: &str) -> Vec<u32> {
+        // Extension query shortcut: ".pdf" → match doc.extension == "pdf"
+        if let Some(ext) = term.strip_prefix('.') {
+            return self
+                .docs
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !self.is_deleted(*i as u32))
+                .filter(|(_, d)| d.extension == ext)
+                .map(|(i, _)| i as u32)
+                .collect();
+        }
+
         let trigrams = extract_trigrams(term);
         if trigrams.len() < 2 {
-            // Short term: keep top N most recent non-deleted docs via min-heap
+            // Short term: bounded scan of all docs — scoring phase will filter
+            // via acronym/prefix/contains. Limit to avoid flooding scoring.
             let mut heap: BinaryHeap<(std::cmp::Reverse<u64>, u32)> =
                 BinaryHeap::with_capacity(SHORT_QUERY_CANDIDATE_LIMIT + 1);
             for (i, doc) in self.docs.iter().enumerate() {
