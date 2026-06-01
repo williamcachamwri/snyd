@@ -89,6 +89,29 @@ pub struct TrigramIndex {
     /// Sum of token counts across all active docs. Used to keep avg_doc_len accurate
     /// without scanning all docs on every remove().
     pub total_doc_len: f32,
+    /// Bitset for fast tombstone checks during query (1 bit per doc_id).
+    /// Replaces the need to access `self.docs[id].deleted` on every candidate.
+    deleted_bits: Vec<u64>,
+}
+
+impl TrigramIndex {
+    /// Fast O(1) tombstone check using the bitset.
+    #[inline]
+    fn is_deleted(&self, doc_id: u32) -> bool {
+        let idx = doc_id as usize / 64;
+        let bit = doc_id as usize % 64;
+        self.deleted_bits.get(idx).map_or(false, |&w| (w >> bit) & 1 == 1)
+    }
+
+    /// Set the deleted bit for a doc_id.
+    #[inline]
+    fn set_deleted(&mut self, doc_id: u32) {
+        let idx = doc_id as usize / 64;
+        let bit = doc_id as usize % 64;
+        if let Some(word) = self.deleted_bits.get_mut(idx) {
+            *word |= 1u64 << bit;
+        }
+    }
 }
 
 /// A scored document for ranking.
@@ -302,6 +325,7 @@ impl TrigramIndex {
 
         let active_doc_count = docs.len();
         let avg_doc_len = if docs.is_empty() { 1.0 } else { total_doc_len / docs.len() as f32 };
+        let deleted_bits = vec![0u64; (docs.len() + 63) / 64];
 
         TrigramIndex {
             docs,
@@ -312,6 +336,7 @@ impl TrigramIndex {
             avg_doc_len,
             active_doc_count,
             total_doc_len,
+            deleted_bits,
         }
     }
 
@@ -362,7 +387,7 @@ impl TrigramIndex {
             let max_dist = (query_lower.len() / 4).max(1).min(2);
             let mut extra = Vec::new();
             for (i, doc) in self.docs.iter().enumerate() {
-                if doc.deleted {
+                if self.is_deleted(i as u32) {
                     continue;
                 }
                 // Fast reject: length difference > max_dist
@@ -412,7 +437,7 @@ impl TrigramIndex {
 
         for doc_id in candidate_ids {
             let doc = &self.docs[doc_id as usize];
-            if doc.deleted {
+            if self.is_deleted(doc_id) {
                 continue;
             }
 
@@ -567,7 +592,7 @@ impl TrigramIndex {
             let mut heap: BinaryHeap<(std::cmp::Reverse<u64>, u32)> =
                 BinaryHeap::with_capacity(SHORT_QUERY_CANDIDATE_LIMIT + 1);
             for (i, doc) in self.docs.iter().enumerate() {
-                if doc.deleted {
+                if self.is_deleted(i as u32) {
                     continue;
                 }
                 heap.push((std::cmp::Reverse(doc.mtime), i as u32));
@@ -584,7 +609,7 @@ impl TrigramIndex {
                 if let Some(bitmap) = self.index.get(tri) {
                     let filtered: RoaringBitmap = bitmap
                         .iter()
-                        .filter(|&id| !self.docs[id as usize].deleted)
+                        .filter(|&id| !self.is_deleted(id))
                         .collect();
                     match candidates {
                         None => candidates = Some(filtered),
@@ -870,6 +895,7 @@ impl TrigramIndex {
             };
 
             self.docs[doc_id as usize].deleted = true;
+            self.set_deleted(doc_id);
             self.tombstone_count += 1;
 
             if self.tombstone_count > 1000 {
@@ -933,6 +959,7 @@ impl TrigramIndex {
         self.docs = new_docs;
         self.index = new_index;
         self.tombstone_count = 0;
+        self.deleted_bits = vec![0u64; (self.docs.len() + 63) / 64];
     }
 }
 
@@ -1054,6 +1081,7 @@ mod tests {
             avg_doc_len: 1.0,
             active_doc_count: 0,
             total_doc_len: 0.0,
+            deleted_bits: Vec::new(),
         };
         for (path, name, mtime) in docs {
             let name_lower = name.to_lowercase();
