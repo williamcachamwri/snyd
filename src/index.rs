@@ -50,17 +50,19 @@ const SHORT_QUERY_CANDIDATE_LIMIT: usize = 5_000;
 /// 1M docs ≈ 200 MB RAM. Cap at 500K to stay under 100 MB for typical use.
 const MAX_INDEX_DOCS: usize = 500_000;
 
+/// Interned string — cheap clone (just increment refcount).
+pub type IStr = std::sync::Arc<str>;
+
 /// A single document in the index.
 pub struct DocEntry {
     pub path: String,
     pub name_lower: String,
-    pub path_dir_lower: String,
     pub acronym: String,
-    pub tokens: Vec<String>,
+    pub tokens: smallvec::SmallVec<[IStr; 4]>,
     /// Body text (OCR / Calendar / Contacts / iMessage) — empty when not yet indexed.
     pub body_lower: String,
     /// Tokens from body — used separately for BM25 body field scoring.
-    pub body_tokens: Vec<String>,
+    pub body_tokens: smallvec::SmallVec<[IStr; 4]>,
     pub kind: ResultKind,
     pub mtime: u64,
     pub size: u64,
@@ -251,11 +253,10 @@ impl TrigramIndex {
                 docs.push(DocEntry {
                     path: path_str,
                     name_lower,
-                    path_dir_lower: String::new(),
                     acronym: String::new(),
-                    tokens: Vec::new(), // filled by from_docs
+                    tokens: smallvec::SmallVec::new(), // filled by from_docs
                     body_lower: String::new(),
-                    body_tokens: Vec::new(),
+                    body_tokens: smallvec::SmallVec::new(),
                     kind,
                     mtime,
                     size,
@@ -278,21 +279,16 @@ impl TrigramIndex {
     /// **Parallel build:** tokenization and trigram extraction run in parallel
     /// via rayon. The sequential merge phase builds the HashMap index.
     pub fn from_docs(raw_docs: Vec<DocEntry>) -> Self {
-        // Phase 1 (parallel): tokenize, extract trigrams, acronym, path_dir for each doc
+        // Phase 1 (parallel): tokenize, extract trigrams, acronym for each doc
         let prepped: Vec<_> = raw_docs
             .into_par_iter()
             .filter(|doc| !doc.deleted)
             .map(|mut doc| {
                 let name_lower = doc.name_lower.to_lowercase();
                 let terms = tokenize(&name_lower);
-                let path_dir_lower = Path::new(&doc.path)
-                    .parent()
-                    .map(|p| p.to_string_lossy().to_lowercase())
-                    .unwrap_or_default();
                 let acronym = extract_acronym(&name_lower);
                 let trigrams = extract_trigrams(&name_lower);
-                doc.tokens = terms.clone();
-                doc.path_dir_lower = path_dir_lower;
+                doc.tokens = terms.iter().map(|s| IStr::from(s.as_str())).collect();
                 doc.acronym = acronym;
                 (doc, terms, trigrams)
             })
@@ -546,13 +542,21 @@ impl TrigramIndex {
                 .min(SCORE_DEPTH_PENALTY_MAX);
             score -= depth_penalty;
 
-            // ── Path segment bonus ────────────────────────────────────────
-            let path_bonus: f32 = query_terms
-                .iter()
-                .filter(|t| t.len() >= 3)
-                .map(|t| if doc.path_dir_lower.contains(t.as_str()) { 8.0 } else { 0.0 })
-                .sum::<f32>()
-                .min(SCORE_PATH_SEGMENT_MAX);
+            // ── Path segment bonus (lazily computed from path to save RAM) ──
+            let path_bonus: f32 = if query_terms.iter().any(|t| t.len() >= 3) {
+                let dir = Path::new(&doc.path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                query_terms
+                    .iter()
+                    .filter(|t| t.len() >= 3)
+                    .map(|t| if dir.contains(t.as_str()) { 8.0 } else { 0.0 })
+                    .sum::<f32>()
+                    .min(SCORE_PATH_SEGMENT_MAX)
+            } else {
+                0.0
+            };
             score += path_bonus;
 
             heap.push(ScoredDoc { doc_id, score });
@@ -637,7 +641,7 @@ impl TrigramIndex {
     }
 
     /// BM25 for a single tokenized field.
-    fn bm25_field(&self, _doc_id: u32, field_tokens: &[String], query_terms: &[String]) -> f32 {
+    fn bm25_field(&self, _doc_id: u32, field_tokens: &[IStr], query_terms: &[String]) -> f32 {
         if query_terms.is_empty() || field_tokens.is_empty() {
             return 0.0;
         }
@@ -649,7 +653,7 @@ impl TrigramIndex {
 
         let mut score = 0.0;
         for term in query_terms {
-            let tf = field_tokens.iter().filter(|&t| t == term).count() as f32;
+            let tf = field_tokens.iter().filter(|&t| t.as_ref() == term.as_str()).count() as f32;
             if tf == 0.0 {
                 continue;
             }
@@ -739,10 +743,6 @@ impl TrigramIndex {
             }
         }
 
-        let path_dir_lower = path
-            .parent()
-            .map(|p| p.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
         let acronym = extract_acronym(&name_lower);
         let extension = path
             .extension()
@@ -754,11 +754,10 @@ impl TrigramIndex {
         self.docs.push(DocEntry {
             path: path_str.clone(),
             name_lower: name_lower.clone(),
-            path_dir_lower,
             acronym,
-            tokens: terms.clone(),
+            tokens: terms.iter().map(|s| IStr::from(s.as_str())).collect(),
             body_lower: String::new(),
-            body_tokens: Vec::new(),
+            body_tokens: smallvec::SmallVec::new(),
             kind,
             mtime,
             size,
@@ -798,10 +797,10 @@ impl TrigramIndex {
         let mut seen = HashSet::new();
         for token in &old_tokens {
             if seen.insert(token.clone()) {
-                if let Some(count) = self.doc_freq.get_mut(token) {
+                if let Some(count) = self.doc_freq.get_mut(token.as_ref()) {
                     *count = count.saturating_sub(1);
                     if *count == 0 {
-                        self.doc_freq.remove(token);
+                        self.doc_freq.remove(token.as_ref());
                     }
                 }
             }
@@ -810,13 +809,14 @@ impl TrigramIndex {
 
         // Tokenize new body
         let body_lower = body.to_lowercase();
-        let new_tokens = tokenize(&body_lower);
+        let new_tokens: smallvec::SmallVec<[IStr; 4]> =
+            tokenize(&body_lower).iter().map(|s| IStr::from(s.as_str())).collect();
 
         // Update doc_freq with new tokens
         let mut seen2 = HashSet::new();
         for token in &new_tokens {
             if seen2.insert(token.clone()) {
-                *self.doc_freq.entry(token.clone()).or_insert(0) += 1;
+                *self.doc_freq.entry(token.to_string()).or_insert(0) += 1;
             }
         }
 
@@ -877,10 +877,10 @@ impl TrigramIndex {
             let mut seen = HashSet::new();
             for term in &tokens {
                 if seen.insert(term.clone()) {
-                    if let Some(count) = self.doc_freq.get_mut(term) {
+                    if let Some(count) = self.doc_freq.get_mut(term.as_ref()) {
                         *count = count.saturating_sub(1);
                         if *count == 0 {
-                            self.doc_freq.remove(term);
+                            self.doc_freq.remove(term.as_ref());
                         }
                     }
                 }
@@ -946,7 +946,7 @@ impl TrigramIndex {
             let mut seen = HashSet::new();
             for term in &doc.tokens {
                 if seen.insert(term.clone()) {
-                    *new_doc_freq.entry(term.clone()).or_insert(0) += 1;
+                    *new_doc_freq.entry(term.to_string()).or_insert(0) += 1;
                 }
             }
             total_doc_len += doc.tokens.len() as f32;
@@ -1085,10 +1085,6 @@ mod tests {
         };
         for (path, name, mtime) in docs {
             let name_lower = name.to_lowercase();
-            let path_dir_lower = Path::new(path.as_str())
-                .parent()
-                .map(|p| p.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
             let acronym = extract_acronym(&name_lower);
             let terms = tokenize(&name_lower);
             let mut seen = HashSet::new();
@@ -1106,11 +1102,10 @@ mod tests {
             index.docs.push(DocEntry {
                 path: path.clone(),
                 name_lower: name_lower.clone(),
-                path_dir_lower,
                 acronym,
-                tokens: terms.clone(),
+                tokens: terms.iter().map(|s| IStr::from(s.as_str())).collect(),
                 body_lower: String::new(),
-                body_tokens: Vec::new(),
+                body_tokens: smallvec::SmallVec::new(),
                 kind: ResultKind::File,
                 mtime: *mtime,
                 size: 0,

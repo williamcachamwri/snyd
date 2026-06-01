@@ -1,30 +1,37 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use crc32fast::Hasher as Crc32Hasher;
+use memmap2::Mmap;
 
 use crate::index::{DocEntry, TrigramIndex};
 use crate::protocol::ResultKind;
 
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3; // bumped for rkyv format
+const MAGIC: &[u8] = b"SNYD";
 
-/// Maximum age of a cache file before it is considered stale, regardless of
-/// filesystem mtime. Safety net for macOS where nested file changes may not
-/// update the top-level scope directory mtime.
-const MAX_CACHE_AGE_SECS: u64 = 86_400; // 24 hours
+/// File layout (little-endian):
+///   [0..4]      magic       "SNYD"
+///   [4..8]      version     u32
+///   [8..16]     data_len    u64
+///   [16..n]     data        rkyv archive bytes
+///   [n..n+4]    checksum    crc32(data)
 
-#[derive(Serialize, Deserialize)]
+// ── rkyv serializable structs ──────────────────────────────────────────────
+
+#[derive(rkyv_derive::Archive, rkyv_derive::Serialize, rkyv_derive::Deserialize)]
+#[archive(check_bytes)]
 struct CacheHeader {
     version: u32,
     built_at: u64, // unix seconds
     scope_mtimes: Vec<(String, u64)>, // (scope path, mtime)
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(rkyv_derive::Archive, rkyv_derive::Serialize, rkyv_derive::Deserialize)]
+#[archive(check_bytes)]
 struct SerialDoc {
     path: String,
     name_lower: String,
-    path_dir_lower: String,
     acronym: String,
     tokens: Vec<String>,
     body_lower: String,
@@ -37,18 +44,19 @@ struct SerialDoc {
     last_accessed: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(rkyv_derive::Archive, rkyv_derive::Serialize, rkyv_derive::Deserialize)]
+#[archive(check_bytes)]
 struct CacheFile {
     header: CacheHeader,
     docs: Vec<SerialDoc>,
 }
 
-/// Return the default cache path inside the given cache directory.
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
 pub fn cache_path(cache_dir: &std::path::Path) -> PathBuf {
-    cache_dir.join("index.bin")
+    cache_dir.join("index_v3.bin")
 }
 
-/// Build a cache header from the current timestamp and scope directory mtimes.
 fn build_header(scopes: &[PathBuf]) -> CacheHeader {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -73,15 +81,13 @@ fn build_header(scopes: &[PathBuf]) -> CacheHeader {
     }
 }
 
-/// Check whether any scope directory has been modified since the cache was built,
-/// or if the cache itself is older than the maximum allowed age.
+const MAX_CACHE_AGE_SECS: u64 = 86_400; // 24 hours
+
 fn scopes_stale(header: &CacheHeader) -> bool {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-
-    // Force rebuild if cache is older than 24h regardless of mtime.
     if now.saturating_sub(header.built_at) > MAX_CACHE_AGE_SECS {
         return true;
     }
@@ -100,12 +106,20 @@ fn scopes_stale(header: &CacheHeader) -> bool {
     false
 }
 
-/// Save the index to disk for fast startup on next launch.
-/// Writes atomically via a temp file + rename.
-///
-/// Memory note: the index is capped at `MAX_INDEX_DOCS` (500K docs, ~100 MB)
-/// to keep both RAM and cache file size bounded for typical macOS use.
-pub fn save(index: &TrigramIndex, scopes: &[PathBuf], cache_dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+fn compute_checksum(data: &[u8]) -> u32 {
+    let mut hasher = Crc32Hasher::new();
+    hasher.update(data);
+    hasher.finalize()
+}
+
+// ── Public API ──────────────────────────────────────────────────────────────
+
+/// Save the index atomically via temp file + rename.
+pub fn save(
+    index: &TrigramIndex,
+    scopes: &[PathBuf],
+    cache_dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let header = build_header(scopes);
     let docs: Vec<SerialDoc> = index
         .docs
@@ -114,11 +128,10 @@ pub fn save(index: &TrigramIndex, scopes: &[PathBuf], cache_dir: &std::path::Pat
         .map(|d| SerialDoc {
             path: d.path.clone(),
             name_lower: d.name_lower.clone(),
-            path_dir_lower: d.path_dir_lower.clone(),
             acronym: d.acronym.clone(),
-            tokens: d.tokens.clone(),
+            tokens: d.tokens.iter().map(|s| s.to_string()).collect(),
             body_lower: d.body_lower.clone(),
-            body_tokens: d.body_tokens.clone(),
+            body_tokens: d.body_tokens.iter().map(|s| s.to_string()).collect(),
             kind: d.kind,
             mtime: d.mtime,
             size: d.size,
@@ -129,29 +142,78 @@ pub fn save(index: &TrigramIndex, scopes: &[PathBuf], cache_dir: &std::path::Pat
         .collect();
 
     let cache = CacheFile { header, docs };
-    let encoded = bincode::serialize(&cache)?;
+
+    // Serialize with rkyv
+    use rkyv::ser::{Serializer, serializers::AllocSerializer};
+    let mut serializer = AllocSerializer::<256>::default();
+    serializer.serialize_value(&cache)?;
+    let archive = serializer.into_serializer().into_inner();
+    let data = archive.as_slice();
+
+    let data_len = data.len() as u64;
+    let checksum = compute_checksum(data);
 
     let path = cache_path(cache_dir);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp_path = path.with_extension("tmp");
-    std::fs::write(&tmp_path, encoded)?;
-    std::fs::rename(&tmp_path, &path)?;
 
+    let tmp_path = path.with_extension("tmp");
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(MAGIC)?;
+        file.write_all(&CACHE_VERSION.to_le_bytes())?;
+        file.write_all(&data_len.to_le_bytes())?;
+        file.write_all(data)?;
+        file.write_all(&checksum.to_le_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, &path)?;
     Ok(())
 }
 
-/// Try to load a cached index. Returns `None` if the cache is missing,
-/// version-mismatched, or any scope has been modified since the cache was built.
+/// Load a cached index via mmap + rkyv deserialization.
+/// Returns `None` if cache is missing, corrupt, version-mismatch, or stale.
 pub fn load(_scopes: &[PathBuf], cache_dir: &std::path::Path) -> Option<TrigramIndex> {
     let path = cache_path(cache_dir);
-    let encoded = std::fs::read(&path).ok()?;
-    let cache: CacheFile = bincode::deserialize(&encoded).ok()?;
+    let file = std::fs::File::open(&path).ok()?;
+    let mmap = unsafe { Mmap::map(&file).ok()? };
+    let bytes: &[u8] = &mmap;
 
-    if cache.header.version != CACHE_VERSION {
+    if bytes.len() < 20 {
         return None;
     }
+
+    // Magic
+    if &bytes[0..4] != MAGIC {
+        return None;
+    }
+
+    // Version
+    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    if version != CACHE_VERSION {
+        return None;
+    }
+
+    // Data length
+    let data_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+    let data_start = 16usize;
+    let data_end = data_start.checked_add(data_len)?;
+    let checksum_start = data_end;
+    if bytes.len() < checksum_start.checked_add(4)? {
+        return None;
+    }
+
+    let data = &bytes[data_start..data_end];
+    let stored_checksum = u32::from_le_bytes(bytes[checksum_start..checksum_start + 4].try_into().unwrap());
+    if compute_checksum(data) != stored_checksum {
+        tracing::warn!("Cache checksum mismatch — rebuilding index");
+        return None;
+    }
+
+    // Deserialize from rkyv (faster than bincode; mmap avoids file read copy)
+    let cache: CacheFile = rkyv::from_bytes(data).ok()?;
 
     if scopes_stale(&cache.header) {
         return None;
@@ -163,11 +225,10 @@ pub fn load(_scopes: &[PathBuf], cache_dir: &std::path::Path) -> Option<TrigramI
         .map(|d| DocEntry {
             path: d.path,
             name_lower: d.name_lower,
-            path_dir_lower: d.path_dir_lower,
             acronym: d.acronym,
-            tokens: d.tokens,
+            tokens: d.tokens.iter().map(|s| crate::index::IStr::from(s.as_str())).collect(),
             body_lower: d.body_lower,
-            body_tokens: d.body_tokens,
+            body_tokens: d.body_tokens.iter().map(|s| crate::index::IStr::from(s.as_str())).collect(),
             kind: d.kind,
             mtime: d.mtime,
             size: d.size,
@@ -194,7 +255,7 @@ mod tests {
     #[test]
     fn test_roundtrip_save_load() {
         let _guard = CACHE_LOCK.lock().unwrap();
-        let dir = std::env::temp_dir().join("snyd_test_persist");
+        let dir = std::env::temp_dir().join("snyd_test_persist_v3");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "test").unwrap();
@@ -203,7 +264,7 @@ mod tests {
         let doc_count = idx.docs.len();
         assert!(doc_count > 0);
 
-        let cache_dir = std::env::temp_dir().join("snyd_test_cache");
+        let cache_dir = std::env::temp_dir().join("snyd_test_cache_v3");
         save(&idx, &[dir.clone()], &cache_dir).unwrap();
 
         let loaded = load(&[dir.clone()], &cache_dir).expect("should load successfully");
@@ -218,8 +279,8 @@ mod tests {
     #[test]
     fn test_stale_cache_returns_none() {
         let _guard = CACHE_LOCK.lock().unwrap();
-        let dir = std::env::temp_dir().join("snyd_test_stale");
-        let cache_dir = std::env::temp_dir().join("snyd_test_stale_cache");
+        let dir = std::env::temp_dir().join("snyd_test_stale_v3");
+        let cache_dir = std::env::temp_dir().join("snyd_test_stale_cache_v3");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&cache_dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -246,20 +307,17 @@ mod tests {
     #[test]
     fn test_version_mismatch_returns_none() {
         let _guard = CACHE_LOCK.lock().unwrap();
-        let cache_dir = std::env::temp_dir().join("snyd_test_version");
+        let cache_dir = std::env::temp_dir().join("snyd_test_version_v3");
         let _ = std::fs::remove_dir_all(&cache_dir);
         std::fs::create_dir_all(&cache_dir).unwrap();
-        let bad = CacheFile {
-            header: CacheHeader {
-                version: 0, // wrong version
-                built_at: 0,
-                scope_mtimes: vec![],
-            },
-            docs: vec![],
-        };
-        let encoded = bincode::serialize(&bad).unwrap();
+
+        // Write a file with wrong magic so version check fails early
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&0u32.to_le_bytes()); // wrong version
+        buf.extend_from_slice(&0u64.to_le_bytes());
         let cache = cache_path(&cache_dir);
-        std::fs::write(&cache, encoded).unwrap();
+        std::fs::write(&cache, buf).unwrap();
 
         assert!(load(&[], &cache_dir).is_none());
 
@@ -270,8 +328,8 @@ mod tests {
     #[test]
     fn test_cache_expires_after_24h() {
         let _guard = CACHE_LOCK.lock().unwrap();
-        let dir = std::env::temp_dir().join("snyd_test_expire");
-        let cache_dir = std::env::temp_dir().join("snyd_test_expire_cache");
+        let dir = std::env::temp_dir().join("snyd_test_expire_v3");
+        let cache_dir = std::env::temp_dir().join("snyd_test_expire_cache_v3");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&cache_dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -280,9 +338,8 @@ mod tests {
         let idx = TrigramIndex::build(&[dir.clone()]);
         save(&idx, &[dir.clone()], &cache_dir).unwrap();
 
-        // Validate the safety-net constant exists in a reasonable range.
-        assert!(MAX_CACHE_AGE_SECS <= 86_400 * 7, "Cache max age should be <= 7 days");
-        assert!(MAX_CACHE_AGE_SECS >= 3_600, "Cache max age should be >= 1 hour");
+        assert!(MAX_CACHE_AGE_SECS <= 86_400 * 7);
+        assert!(MAX_CACHE_AGE_SECS >= 3_600);
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&cache_dir);
@@ -291,10 +348,10 @@ mod tests {
 
     #[test]
     fn test_cache_path_is_user_specific() {
-        let cache_dir = std::env::temp_dir().join("snyd_test_path");
+        let cache_dir = std::env::temp_dir().join("snyd_test_path_v3");
         let path = cache_path(&cache_dir);
         assert!(
-            path.to_string_lossy().contains("snyd_test_path"),
+            path.to_string_lossy().contains("snyd_test_path_v3"),
             "Cache path should contain cache_dir name, got: {:?}",
             path
         );

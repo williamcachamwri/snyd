@@ -54,11 +54,10 @@ fn build_index_from_corpus(corpus: &[(String, String, u64)]) -> TrigramIndex {
             DocEntry {
                 path: path.clone(),
                 name_lower: name.to_lowercase(),
-                path_dir_lower: String::new(),
                 acronym: String::new(),
-                tokens: Vec::new(),
+                tokens: smallvec::SmallVec::new(),
                 body_lower: String::new(),
-                body_tokens: Vec::new(),
+                body_tokens: smallvec::SmallVec::new(),
                 kind: snyd::protocol::ResultKind::File,
                 mtime: *mtime,
                 size: 1024,

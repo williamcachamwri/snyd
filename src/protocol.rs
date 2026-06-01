@@ -54,8 +54,10 @@ pub struct SearchResult {
 }
 
 /// Result kind mirrors the Swift enum.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(rkyv_derive::Archive, rkyv_derive::Serialize, rkyv_derive::Deserialize)]
+#[archive(check_bytes)]
 pub enum ResultKind {
     Application,
     Folder,
