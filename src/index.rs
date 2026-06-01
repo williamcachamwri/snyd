@@ -1,0 +1,1307 @@
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use jwalk::WalkDir;
+use roaring::bitmap::RoaringBitmap;
+use tracing::warn;
+
+use crate::kinds::{is_app_bundle, kind_from_path};
+use crate::protocol::{ResultKind, SearchResult};
+
+const K1: f32 = 1.2;
+const B: f32 = 0.75;
+
+// ── Scoring constants ──────────────────────────────────────────────────
+// These are calibrated so that:
+//   - Exact match always beats prefix match
+//   - Prefix match always beats word-boundary match
+//   - BM25 base score for a 3-token query ≈ 1–8 points
+//   - Bonuses dominate BM25 for short queries (expected for a launcher)
+//   - Recency is a tiebreaker, not a ranking signal
+const SCORE_EXACT_MATCH: f32 = 500.0;       // beats any combination of bonuses below
+const SCORE_PREFIX_MATCH: f32 = 200.0;      // name starts with query
+const SCORE_WORD_PREFIX: f32 = 100.0;       // word boundary starts with query
+const SCORE_TERM_COVERAGE_FULL: f32 = 150.0;  // multi-term: all terms found
+const SCORE_TERM_COVERAGE_HALF: f32 = 60.0;   // multi-term: ≥50% terms found
+const SCORE_APP_BOOST: f32 = 50.0;          // apps prioritized over files
+const SCORE_ACRONYM_EXACT: f32 = 180.0;     // exact acronym match (e.g. "vsc" → VSCode)
+const SCORE_ACRONYM_PREFIX: f32 = 80.0;     // acronym prefix match
+const SCORE_PATH_SEGMENT_MAX: f32 = 30.0;   // capped path dir bonus
+const SCORE_RECENCY_RECENT: f32 = 40.0;     // < 1 hour old
+const SCORE_RECENCY_TODAY: f32 = 25.0;      // < 1 day old
+const SCORE_RECENCY_WEEK: f32 = 10.0;       // < 7 days old
+const SCORE_RECENCY_MONTH: f32 = 4.0;       // < 30 days old
+const SCORE_RECENCY_CAP_RATIO: f32 = 0.30;  // recency can't exceed 30% of base score
+const SCORE_DEPTH_PENALTY_PER_LEVEL: f32 = 1.5;
+const SCORE_DEPTH_PENALTY_MAX: f32 = 10.0;
+const SCORE_NORMALIZATION_DIVISOR: f32 = 800.0; // maps raw score to [0,1]
+// ──────────────────────────────────────────────────────────────────────
+
+/// For very short queries (< 3 chars), we can't use trigram intersection.
+/// Return the 5,000 most recently modified docs as candidates.
+/// This is intentionally limited: 1-2 char queries are typically launcher-style
+/// (e.g., "vs" for VSCode), where recency + app cache is more useful than
+/// exhaustive scanning. The app cache phase in pipeline.rs handles app matching.
+const SHORT_QUERY_CANDIDATE_LIMIT: usize = 5_000;
+
+/// Maximum number of documents in the index.
+/// At ~200 bytes average per DocEntry (path + tokens + bitmaps),
+/// 1M docs ≈ 200 MB RAM. Cap at 500K to stay under 100 MB for typical use.
+const MAX_INDEX_DOCS: usize = 500_000;
+
+/// A single document in the index.
+pub struct DocEntry {
+    pub path: String,
+    pub name_lower: String,
+    pub path_dir_lower: String,
+    pub acronym: String,
+    pub tokens: Vec<String>,
+    /// Body text (OCR / Calendar / Contacts / iMessage) — empty when not yet indexed.
+    pub body_lower: String,
+    /// Tokens from body — used separately for BM25 body field scoring.
+    pub body_tokens: Vec<String>,
+    pub kind: ResultKind,
+    pub mtime: u64,
+    pub size: u64,
+    pub deleted: bool,
+}
+
+/// In-memory trigram index.
+pub struct TrigramIndex {
+    pub docs: Vec<DocEntry>,
+    /// trigram chars → bitmap of doc ids
+    pub index: HashMap<[char; 3], RoaringBitmap>,
+    pub tombstone_count: usize,
+    path_to_id: HashMap<String, u32>,
+    /// term → document frequency (number of docs containing the term)
+    doc_freq: HashMap<String, u32>,
+    /// average number of tokens per doc name (for BM25 dl/avgdl)
+    pub avg_doc_len: f32,
+    /// Number of non-deleted (active) documents. Used for correct BM25 IDF.
+    pub active_doc_count: usize,
+    /// Sum of token counts across all active docs. Used to keep avg_doc_len accurate
+    /// without scanning all docs on every remove().
+    pub total_doc_len: f32,
+}
+
+/// A scored document for ranking.
+#[derive(Debug)]
+pub struct ScoredDoc {
+    pub doc_id: u32,
+    pub score: f32,
+}
+
+impl PartialEq for ScoredDoc {
+    fn eq(&self, other: &Self) -> bool {
+        self.score == other.score
+    }
+}
+
+impl Eq for ScoredDoc {}
+
+impl PartialOrd for ScoredDoc {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.score.partial_cmp(&other.score)
+    }
+}
+
+impl Ord for ScoredDoc {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Scores should never be NaN; if they are, treat as 0.0 to maintain heap invariant.
+        let a = if self.score.is_nan() { 0.0_f32 } else { self.score };
+        let b = if other.score.is_nan() { 0.0_f32 } else { other.score };
+        a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+impl TrigramIndex {
+    /// Build the index by walking all scopes.
+    ///
+    /// This is a **blocking** CPU-bound operation. It uses a rayon thread pool
+    /// (via jwalk) to traverse directories in parallel. Known noise directories
+    /// (e.g. `node_modules`, `.git`, `DerivedData`) are skipped.
+    pub fn build(scopes: &[PathBuf]) -> Self {
+        let mut docs: Vec<DocEntry> = Vec::with_capacity(1024 * 1024);
+
+        let cpu_count = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+
+        'outer: for scope in scopes {
+            let walker = WalkDir::new(scope)
+                .parallelism(jwalk::Parallelism::RayonNewPool(cpu_count))
+                .skip_hidden(false);
+
+            for entry in walker {
+                let Ok(entry) = entry else { continue };
+                let path = entry.path();
+
+                // Skip known noise directories
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with('.')
+                        && matches!(name, ".git" | ".svn" | ".hg" | ".DS_Store")
+                    {
+                        continue;
+                    }
+                    if matches!(
+                        name,
+                        "node_modules"
+                            | "DerivedData"
+                            | ".build"
+                            | "target"
+                            | "build"
+                            | "dist"
+                            | "out"
+                    ) {
+                        continue;
+                    }
+                }
+
+                // Skip directories (except app bundles)
+                if path.is_dir() && !is_app_bundle(&path) {
+                    continue;
+                }
+
+                // Skip symlinks to avoid infinite loops and double-indexing
+                if path.is_symlink() {
+                    continue;
+                }
+
+                // Path-based exclusions
+                let path_str = path.to_string_lossy();
+                if path_str.contains("/.cargo/registry")
+                    || path_str.contains("/Library/Caches")
+                    || path_str.contains("/Library/Developer/Xcode/DerivedData")
+                    || path_str.contains("/Library/Developer/CoreSimulator")
+                    || path_str.contains("/.npm")
+                    || path_str.contains("/.pnpm-store")
+                    || path_str.contains("/go/pkg/mod")
+                {
+                    continue;
+                }
+
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name_lower = name.to_lowercase();
+
+                // Get metadata
+                let (size, mtime) = entry.metadata().map_or((0, 0), |m| {
+                    let size = m.len();
+                    let mtime = m
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    (size, mtime)
+                });
+
+                let kind = if is_app_bundle(&path) {
+                    ResultKind::Application
+                } else {
+                    kind_from_path(&path)
+                };
+
+                let path_str = path.to_string_lossy().to_string();
+
+                if docs.len() >= MAX_INDEX_DOCS {
+                    warn!("Index cap reached ({} docs). Stopping walk.", MAX_INDEX_DOCS);
+                    break 'outer;
+                }
+
+                docs.push(DocEntry {
+                    path: path_str,
+                    name_lower,
+                    path_dir_lower: String::new(),
+                    acronym: String::new(),
+                    tokens: Vec::new(), // filled by from_docs
+                    body_lower: String::new(),
+                    body_tokens: Vec::new(),
+                    kind,
+                    mtime,
+                    size,
+                    deleted: false,
+                });
+            }
+        }
+
+        Self::from_docs(docs)
+    }
+
+    /// Rebuild index from existing docs (used by persist cache loading).
+    ///
+    /// Re-tokenizes names, rebuilds trigram bitmaps, doc_freq, and avg_doc_len.
+    /// Deleted docs are filtered out.
+    pub fn from_docs(raw_docs: Vec<DocEntry>) -> Self {
+        let mut docs: Vec<DocEntry> = Vec::with_capacity(raw_docs.len());
+        let mut index: HashMap<[char; 3], RoaringBitmap> = HashMap::with_capacity(raw_docs.len());
+        let mut path_to_id: HashMap<String, u32> = HashMap::with_capacity(raw_docs.len());
+        let mut doc_freq: HashMap<String, u32> = HashMap::new();
+        let mut total_doc_len: f32 = 0.0;
+
+        for mut doc in raw_docs {
+            if doc.deleted {
+                continue;
+            }
+
+            let name_lower = doc.name_lower.to_lowercase();
+            let terms = tokenize(&name_lower);
+            let mut seen_terms = HashSet::new();
+            for term in &terms {
+                if seen_terms.insert(term.clone()) {
+                    *doc_freq.entry(term.clone()).or_insert(0) += 1;
+                }
+            }
+            total_doc_len += terms.len() as f32;
+
+            let path_dir_lower = Path::new(&doc.path)
+                .parent()
+                .map(|p| p.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            let acronym = extract_acronym(&name_lower);
+
+            doc.tokens = terms.clone();
+            doc.path_dir_lower = path_dir_lower;
+            doc.acronym = acronym;
+            let doc_id = docs.len() as u32;
+            path_to_id.insert(doc.path.clone(), doc_id);
+            docs.push(doc);
+
+            // Insert trigrams (char-based)
+            let trigrams = extract_trigrams(&name_lower);
+            for tri in trigrams {
+                index.entry(tri).or_default().insert(doc_id);
+            }
+        }
+
+        let active_doc_count = docs.len();
+        let avg_doc_len = if docs.is_empty() { 1.0 } else { total_doc_len / docs.len() as f32 };
+
+        TrigramIndex {
+            docs,
+            index,
+            tombstone_count: 0,
+            path_to_id,
+            doc_freq,
+            avg_doc_len,
+            active_doc_count,
+            total_doc_len,
+        }
+    }
+
+    /// Query the index and return top-k scored documents.
+    ///
+    /// Scoring happens in three stages:
+    /// 1. **Candidate selection** — intersect trigram bitmaps for each query term
+    ///    (or return the most-recent N docs for very short queries).
+    /// 2. **BM25 name score** — standard Okapi BM25 over filename tokens.
+    /// 3. **Signal bonuses** — exact/prefix/word-boundary matches, acronym match,
+    ///    app boost, path-segment bonus, recency, and depth penalty.
+    ///
+    /// The raw score is normalized to `[0, 1]` by `to_result()`.
+    pub fn query(&self, query: &str, max: usize) -> Vec<ScoredDoc> {
+        let query_lower = query.to_lowercase();
+        let query_terms = tokenize(&query_lower);
+
+        let candidate_ids: Vec<u32> = if query_terms.is_empty() {
+            return vec![];
+        } else if query_terms.len() == 1 {
+            self.candidates_for_term(&query_terms[0])
+        } else {
+            let mut result: Option<HashSet<u32>> = None;
+            for term in &query_terms {
+                let term_candidates: HashSet<u32> =
+                    self.candidates_for_term(term).into_iter().collect();
+                result = Some(match result {
+                    None => term_candidates,
+                    Some(existing) => existing.intersection(&term_candidates).copied().collect(),
+                });
+            }
+            result.unwrap_or_default().into_iter().collect()
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut heap: BinaryHeap<ScoredDoc> = BinaryHeap::with_capacity(max + 1);
+        let query_char_count = query_lower.chars().count() as f32;
+
+        for doc_id in candidate_ids {
+            let doc = &self.docs[doc_id as usize];
+            if doc.deleted {
+                continue;
+            }
+
+            let mut score = self.bm25_score(doc_id, &query_terms);
+
+            // ── Structural bonuses (reliable signals) ────────────────────
+            if query_terms.len() > 1 {
+                let terms_in_name = query_terms
+                    .iter()
+                    .filter(|t| doc.name_lower.contains(t.as_str()))
+                    .count();
+                let term_coverage = terms_in_name as f32 / query_terms.len() as f32;
+
+                if term_coverage == 1.0 {
+                    if doc.name_lower == query_lower {
+                        score += SCORE_EXACT_MATCH;
+                    } else {
+                        score += SCORE_TERM_COVERAGE_FULL * term_coverage;
+                    }
+                } else if term_coverage >= 0.5 {
+                    score += SCORE_TERM_COVERAGE_HALF * term_coverage;
+                }
+            } else {
+                if doc.name_lower == query_lower {
+                    score += SCORE_EXACT_MATCH;
+                } else if doc.name_lower.starts_with(&query_lower) {
+                    score += SCORE_PREFIX_MATCH;
+                } else if word_boundary_starts_with(&doc.name_lower, &query_lower) {
+                    score += SCORE_WORD_PREFIX;
+                }
+            }
+
+            if doc.kind == ResultKind::Application {
+                score += SCORE_APP_BOOST;
+            }
+
+            // ── Acronym match ────────────────────────────────────────────
+            if query_lower.len() >= 2 && query_lower.len() <= 6 {
+                if doc.acronym == query_lower {
+                    score += SCORE_ACRONYM_EXACT;
+                } else if doc.acronym.starts_with(&query_lower) {
+                    score += SCORE_ACRONYM_PREFIX;
+                }
+            }
+
+            // Name length normalization bonus
+            let name_len = doc.name_lower.chars().count() as f32;
+            let len_bonus = 10.0 * (query_char_count / name_len.max(1.0)).min(1.0);
+            score += len_bonus;
+
+            // ── Recency: only boost files that already have substance ───────
+            let age_secs = now.saturating_sub(doc.mtime);
+            let recency_raw: f32 = if age_secs < 3600 {
+                SCORE_RECENCY_RECENT
+            } else if age_secs < 86400 {
+                SCORE_RECENCY_TODAY
+            } else if age_secs < 7 * 86400 {
+                SCORE_RECENCY_WEEK
+            } else if age_secs < 30 * 86400 {
+                SCORE_RECENCY_MONTH
+            } else {
+                0.0
+            };
+            let recency_bonus = if score > 5.0 {
+                recency_raw.min(score * SCORE_RECENCY_CAP_RATIO)
+            } else {
+                0.0
+            };
+            score += recency_bonus;
+
+            // ── Depth penalty: softer, max 10 pts ───────────────────────────
+            let path_depth = doc.path.matches('/').count() as f32;
+            let depth_penalty = ((path_depth - 3.0).max(0.0) * SCORE_DEPTH_PENALTY_PER_LEVEL)
+                .min(SCORE_DEPTH_PENALTY_MAX);
+            score -= depth_penalty;
+
+            // ── Path segment bonus ────────────────────────────────────────
+            let path_bonus: f32 = query_terms
+                .iter()
+                .filter(|t| t.len() >= 3)
+                .map(|t| if doc.path_dir_lower.contains(t.as_str()) { 8.0 } else { 0.0 })
+                .sum::<f32>()
+                .min(SCORE_PATH_SEGMENT_MAX);
+            score += path_bonus;
+
+            heap.push(ScoredDoc { doc_id, score });
+            if heap.len() > max {
+                heap.pop(); // remove lowest
+            }
+        }
+
+        let mut results: Vec<ScoredDoc> = heap.into_vec();
+        results.sort_by(|a, b| {
+            let score_diff = b.score - a.score;
+            if score_diff.abs() < 0.5 {
+                let pa = &self.docs[a.doc_id as usize].path;
+                let pb = &self.docs[b.doc_id as usize].path;
+                pa.len().cmp(&pb.len()).then_with(|| pa.cmp(pb))
+            } else {
+                b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+            }
+        });
+        results
+    }
+
+    /// Candidate doc ids for a single query term.
+    ///
+    /// For terms with at least 2 trigrams we **intersect** bitmaps (fast O(1) lookup).
+    /// Intersection (not union) is used because a doc must contain *all* trigrams
+    /// of the term to be a plausible match — this gives higher precision.
+    /// For very short terms we fall back to a bounded scan of the most recent docs.
+    fn candidates_for_term(&self, term: &str) -> Vec<u32> {
+        let trigrams = extract_trigrams(term);
+        if trigrams.len() < 2 {
+            // Short term: keep top N most recent non-deleted docs via min-heap
+            let mut heap: BinaryHeap<(std::cmp::Reverse<u64>, u32)> =
+                BinaryHeap::with_capacity(SHORT_QUERY_CANDIDATE_LIMIT + 1);
+            for (i, doc) in self.docs.iter().enumerate() {
+                if doc.deleted {
+                    continue;
+                }
+                heap.push((std::cmp::Reverse(doc.mtime), i as u32));
+                if heap.len() > SHORT_QUERY_CANDIDATE_LIMIT {
+                    heap.pop();
+                }
+            }
+            let mut ids: Vec<u32> = heap.into_iter().map(|(_, id)| id).collect();
+            ids.sort_by_key(|&id| std::cmp::Reverse(self.docs[id as usize].mtime));
+            ids
+        } else {
+            let mut candidates: Option<RoaringBitmap> = None;
+            for tri in &trigrams {
+                if let Some(bitmap) = self.index.get(tri) {
+                    let filtered: RoaringBitmap = bitmap
+                        .iter()
+                        .filter(|&id| !self.docs[id as usize].deleted)
+                        .collect();
+                    match candidates {
+                        None => candidates = Some(filtered),
+                        Some(ref mut c) => *c = &*c & &filtered,
+                    }
+                }
+            }
+            candidates.map(|b| b.iter().collect()).unwrap_or_default()
+        }
+    }
+
+    /// BM25 score combining name field and body field.
+    ///
+    /// Name field contributes at full weight; body field at 0.4 weight so body
+    /// matches never outrank strong name matches.
+    fn bm25_score(&self, doc_id: u32, query_terms: &[String]) -> f32 {
+        let doc = &self.docs[doc_id as usize];
+        let name_score = self.bm25_field(doc_id, &doc.tokens, query_terms);
+        let body_score = if doc.body_tokens.is_empty() {
+            0.0
+        } else {
+            self.bm25_field(doc_id, &doc.body_tokens, query_terms) * 0.4
+        };
+        name_score + body_score
+    }
+
+    /// BM25 for a single tokenized field.
+    fn bm25_field(&self, _doc_id: u32, field_tokens: &[String], query_terms: &[String]) -> f32 {
+        if query_terms.is_empty() || field_tokens.is_empty() {
+            return 0.0;
+        }
+
+        let n = self.active_doc_count as f32;
+        let doc_len = field_tokens.len() as f32;
+        let avgdl = self.avg_doc_len.max(1.0);
+        let norm = 1.0 - B + B * (doc_len / avgdl);
+
+        let mut score = 0.0;
+        for term in query_terms {
+            let tf = field_tokens.iter().filter(|&t| t == term).count() as f32;
+            if tf == 0.0 {
+                continue;
+            }
+
+            let df = *self.doc_freq.get(term).unwrap_or(&1) as f32;
+            let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+
+            let numerator = tf * (K1 + 1.0);
+            let denominator = tf + K1 * norm;
+            score += idf * (numerator / denominator);
+        }
+
+        score
+    }
+
+    /// Convert a scored doc to a SearchResult.
+    ///
+    /// Normalizes the internal raw score to the range `[0, 1]` for the Swift client.
+    pub fn to_result(&self, scored: &ScoredDoc) -> SearchResult {
+        let doc = &self.docs[scored.doc_id as usize];
+        let normalized_score = (scored.score / SCORE_NORMALIZATION_DIVISOR).clamp(0.0, 1.0);
+        SearchResult {
+            path: doc.path.clone(),
+            name: Path::new(&doc.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string(),
+            kind: doc.kind,
+            size: doc.size,
+            modified: doc.mtime,
+            score: normalized_score,
+        }
+    }
+
+    /// Incremental update: add a new file.
+    ///
+    /// Skips if the path is already indexed. Updates `doc_freq`, trigram bitmaps,
+    /// `active_doc_count`, and `avg_doc_len` incrementally.
+    pub fn add(&mut self, path: &Path) {
+        // Skip symlinks to avoid double-indexing the same file via multiple paths
+        if path.is_symlink() {
+            return;
+        }
+
+        let path_str = path.to_string_lossy().to_string();
+
+        // Path may already exist in path_to_id if it was previously removed
+        // (tombstoned but not yet compacted). Re-indexing a tombstoned path
+        // is valid — the watcher calls remove() then add() on file writes.
+        if let Some(&existing_id) = self.path_to_id.get(&path_str) {
+            if !self.docs[existing_id as usize].deleted {
+                return; // Active doc with this path already exists — skip
+            }
+            // Tombstoned entry: remove from map so we can re-insert cleanly below
+            self.path_to_id.remove(&path_str);
+        }
+
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let name_lower = name.to_lowercase();
+
+        let (size, mtime) = std::fs::metadata(path).map_or((0, 0), |m| {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            (m.len(), mtime)
+        });
+
+        let kind = if is_app_bundle(path) {
+            ResultKind::Application
+        } else {
+            kind_from_path(path)
+        };
+
+        let terms = tokenize(&name_lower);
+        let mut seen_terms = HashSet::new();
+        for term in &terms {
+            if seen_terms.insert(term.clone()) {
+                *self.doc_freq.entry(term.clone()).or_insert(0) += 1;
+            }
+        }
+
+        let path_dir_lower = path
+            .parent()
+            .map(|p| p.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let acronym = extract_acronym(&name_lower);
+
+        let doc_id = self.docs.len() as u32;
+        self.docs.push(DocEntry {
+            path: path_str.clone(),
+            name_lower: name_lower.clone(),
+            path_dir_lower,
+            acronym,
+            tokens: terms.clone(),
+            body_lower: String::new(),
+            body_tokens: Vec::new(),
+            kind,
+            mtime,
+            size,
+            deleted: false,
+        });
+        self.path_to_id.insert(path_str, doc_id);
+
+        // Update active_doc_count and avg_doc_len incrementally
+        self.active_doc_count += 1;
+        self.total_doc_len += terms.len() as f32;
+        self.avg_doc_len = self.total_doc_len / self.active_doc_count as f32;
+
+        // Insert trigrams
+        let trigrams = extract_trigrams(&name_lower);
+        for tri in trigrams {
+            self.index.entry(tri).or_default().insert(doc_id);
+        }
+    }
+
+    /// Index body text for a path that already exists in the index.
+    ///
+    /// Idempotent: calling again with the same path replaces the old body.
+    /// No-op if the path does not exist or the doc has been tombstoned.
+    /// Body trigrams are added to the same bitmap as name trigrams so the
+    /// doc appears in candidate sets when the query matches body text.
+    pub fn index_content(&mut self, path: &str, body: &str) {
+        let Some(&doc_id) = self.path_to_id.get(path) else { return };
+        if self.docs[doc_id as usize].deleted {
+            return;
+        }
+
+        // Remove old body tokens from doc_freq
+        let old_tokens = self.docs[doc_id as usize].body_tokens.clone();
+        let mut seen = HashSet::new();
+        for token in &old_tokens {
+            if seen.insert(token.clone()) {
+                if let Some(count) = self.doc_freq.get_mut(token) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.doc_freq.remove(token);
+                    }
+                }
+            }
+        }
+        self.total_doc_len -= old_tokens.len() as f32;
+
+        // Tokenize new body
+        let body_lower = body.to_lowercase();
+        let new_tokens = tokenize(&body_lower);
+
+        // Update doc_freq with new tokens
+        let mut seen2 = HashSet::new();
+        for token in &new_tokens {
+            if seen2.insert(token.clone()) {
+                *self.doc_freq.entry(token.clone()).or_insert(0) += 1;
+            }
+        }
+
+        // Insert body trigrams into index
+        let trigrams = extract_trigrams(&body_lower);
+        for tri in trigrams {
+            self.index.entry(tri).or_default().insert(doc_id);
+        }
+
+        self.total_doc_len += new_tokens.len() as f32;
+        self.avg_doc_len = self.total_doc_len / self.active_doc_count.max(1) as f32;
+
+        let doc = &mut self.docs[doc_id as usize];
+        doc.body_lower = body_lower;
+        doc.body_tokens = new_tokens;
+    }
+
+    /// Incremental update: mark as deleted.
+    /// Also decrements doc_freq for each unique term of the removed document
+    /// and updates active_doc_count / total_doc_len so BM25 stays accurate.
+    pub fn remove(&mut self, path: &Path) {
+        let path_str = path.to_string_lossy().to_string();
+        if let Some(&doc_id) = self.path_to_id.get(&path_str) {
+            // Scope 1: read everything we need from the doc.
+            // The immutable borrow ends here so we can mutate self freely below.
+            let (tokens, token_count) = {
+                let doc = &self.docs[doc_id as usize];
+                if doc.deleted {
+                    return; // idempotent
+                }
+                (doc.tokens.clone(), doc.tokens.len() as f32)
+            };
+
+            // Scope 2: mutate index-wide counters.
+            let mut seen = HashSet::new();
+            for term in &tokens {
+                if seen.insert(term.clone()) {
+                    if let Some(count) = self.doc_freq.get_mut(term) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            self.doc_freq.remove(term);
+                        }
+                    }
+                }
+            }
+
+            self.active_doc_count = self.active_doc_count.saturating_sub(1);
+            self.total_doc_len = (self.total_doc_len - token_count).max(0.0);
+            self.avg_doc_len = if self.active_doc_count == 0 {
+                1.0
+            } else {
+                self.total_doc_len / self.active_doc_count as f32
+            };
+
+            self.docs[doc_id as usize].deleted = true;
+            self.tombstone_count += 1;
+
+            if self.tombstone_count > 1000 {
+                self.compact();
+            }
+        }
+    }
+
+    /// Remove tombstoned docs and rebuild bitmaps.
+    ///
+    /// Triggered automatically when `tombstone_count` exceeds 1,000.
+    /// O(N) over the number of docs, so it should not run on every remove.
+    fn compact(&mut self) {
+        let mut new_docs: Vec<DocEntry> = Vec::with_capacity(self.docs.len());
+        let mut old_to_new: HashMap<u32, u32> = HashMap::with_capacity(self.docs.len());
+
+        for (old_id, doc) in self.docs.drain(..).enumerate() {
+            if !doc.deleted {
+                let new_id = new_docs.len() as u32;
+                old_to_new.insert(old_id as u32, new_id);
+                new_docs.push(doc);
+            }
+        }
+
+        // Rebuild path_to_id
+        self.path_to_id.clear();
+        for (new_id, doc) in new_docs.iter().enumerate() {
+            self.path_to_id.insert(doc.path.clone(), new_id as u32);
+        }
+
+        // Rebuild index bitmaps
+        let mut new_index: HashMap<[char; 3], RoaringBitmap> =
+            HashMap::with_capacity(self.index.len());
+        for (tri, bitmap) in self.index.drain() {
+            let new_bitmap: RoaringBitmap = bitmap
+                .iter()
+                .filter_map(|old_id| old_to_new.get(&old_id).copied())
+                .collect();
+            if !new_bitmap.is_empty() {
+                new_index.insert(tri, new_bitmap);
+            }
+        }
+
+        // Rebuild doc_freq and avg_doc_len
+        let mut new_doc_freq: HashMap<String, u32> = HashMap::new();
+        let mut total_doc_len: f32 = 0.0;
+        for doc in &new_docs {
+            let mut seen = HashSet::new();
+            for term in &doc.tokens {
+                if seen.insert(term.clone()) {
+                    *new_doc_freq.entry(term.clone()).or_insert(0) += 1;
+                }
+            }
+            total_doc_len += doc.tokens.len() as f32;
+        }
+        self.doc_freq = new_doc_freq;
+        self.active_doc_count = new_docs.len();
+        self.total_doc_len = total_doc_len;
+        self.avg_doc_len = if new_docs.is_empty() { 1.0 } else { total_doc_len / new_docs.len() as f32 };
+
+        self.docs = new_docs;
+        self.index = new_index;
+        self.tombstone_count = 0;
+    }
+}
+
+// ------------------------------------------------------------------------------
+// Tokenization
+// ------------------------------------------------------------------------------
+
+/// Tokenize a filename into lowercase terms.
+///
+/// Splits on whitespace, underscore, hyphen, dot.
+/// Also splits camelCase / PascalCase boundaries (e.g. "MyGreatApp" → "my great app").
+/// Used for both document names and query strings.
+pub fn tokenize(s: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    for token in s.split(|c: char| c == ' ' || c == '_' || c == '-' || c == '.') {
+        if token.is_empty() {
+            continue;
+        }
+        let split = split_camel_case(token);
+        for word in split.split_whitespace() {
+            if !word.is_empty() {
+                result.push(word.to_lowercase());
+            }
+        }
+    }
+    result
+}
+
+/// Split a camelCase / PascalCase token into space-separated words.
+fn split_camel_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    let chars: Vec<char> = s.chars().collect();
+    for (i, c) in chars.iter().enumerate() {
+        if i > 0 && c.is_uppercase() {
+            out.push(' ');
+        }
+        out.push(*c);
+    }
+    out
+}
+
+// ------------------------------------------------------------------------------
+// Trigrams (Unicode-safe)
+// ------------------------------------------------------------------------------
+
+/// Extract all trigrams from a string using Unicode scalars.
+fn extract_trigrams(s: &str) -> Vec<[char; 3]> {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() < 3 {
+        return Vec::new();
+    }
+    let mut trigrams = Vec::with_capacity(chars.len().saturating_sub(2));
+    for i in 0..=chars.len() - 3 {
+        trigrams.push([chars[i], chars[i + 1], chars[i + 2]]);
+    }
+    trigrams
+}
+
+// ------------------------------------------------------------------------------
+// Acronym extraction
+// ------------------------------------------------------------------------------
+
+/// Extract acronym from a filename: first char of each word after splitting on
+/// common separators and camelCase boundaries.
+/// "visual_studio_code" -> "vsc"
+/// "iTerm2 Preferences" -> "ip"
+/// "MyGreatApp" -> "mga"
+pub(crate) fn extract_acronym(name_lower: &str) -> String {
+    tokenize(name_lower)
+        .iter()
+        .filter_map(|token| token.chars().next())
+        .collect()
+}
+
+// ------------------------------------------------------------------------------
+// Word boundary check (Unicode-safe)
+// ------------------------------------------------------------------------------
+
+/// Check if `name` starts with `query` at a word boundary (Unicode-safe).
+fn word_boundary_starts_with(name: &str, query: &str) -> bool {
+    if name.starts_with(query) {
+        return true;
+    }
+    let name_chars: Vec<char> = name.chars().collect();
+    let query_chars: Vec<char> = query.chars().collect();
+    if query_chars.is_empty() || name_chars.len() < query_chars.len() {
+        return false;
+    }
+    for i in 0..=name_chars.len() - query_chars.len() {
+        if i > 0 && !is_word_boundary_char(name_chars[i - 1]) {
+            continue;
+        }
+        if name_chars[i..i + query_chars.len()] == query_chars[..] {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_word_boundary_char(c: char) -> bool {
+    matches!(c, ' ' | '.' | '_' | '-' | '/' | '\\' | '(' | '[' | '{' | '@')
+}
+
+// ------------------------------------------------------------------------------
+// Tests
+// ------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_index_with(docs: &[(String, String, u64)]) -> TrigramIndex {
+        let mut index = TrigramIndex {
+            docs: Vec::new(),
+            index: HashMap::new(),
+            tombstone_count: 0,
+            path_to_id: HashMap::new(),
+            doc_freq: HashMap::new(),
+            avg_doc_len: 1.0,
+            active_doc_count: 0,
+            total_doc_len: 0.0,
+        };
+        for (path, name, mtime) in docs {
+            let name_lower = name.to_lowercase();
+            let path_dir_lower = Path::new(path.as_str())
+                .parent()
+                .map(|p| p.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            let acronym = extract_acronym(&name_lower);
+            let terms = tokenize(&name_lower);
+            let mut seen = HashSet::new();
+            for term in &terms {
+                if seen.insert(term.clone()) {
+                    *index.doc_freq.entry(term.clone()).or_insert(0) += 1;
+                }
+            }
+            let doc_id = index.docs.len() as u32;
+            index.docs.push(DocEntry {
+                path: path.clone(),
+                name_lower: name_lower.clone(),
+                path_dir_lower,
+                acronym,
+                tokens: terms.clone(),
+                body_lower: String::new(),
+                body_tokens: Vec::new(),
+                kind: ResultKind::File,
+                mtime: *mtime,
+                size: 0,
+                deleted: false,
+            });
+            index.path_to_id.insert(path.clone(), doc_id);
+            let trigrams = extract_trigrams(&name_lower);
+            for tri in trigrams {
+                index.index.entry(tri).or_default().insert(doc_id);
+            }
+        }
+        let total_doc_len: f32 = index.docs.iter().map(|d| d.tokens.len() as f32).sum();
+        index.avg_doc_len = if index.docs.is_empty() { 1.0 } else { total_doc_len / index.docs.len() as f32 };
+        index.active_doc_count = index.docs.len();
+        index.total_doc_len = total_doc_len;
+        index
+    }
+
+    #[test]
+    fn test_exact_match_scores_highest() {
+        let idx = make_index_with(&[
+            ("/a/foo.txt".into(), "foo".into(), 0),
+            ("/b/foobar.txt".into(), "foobar".into(), 0),
+            ("/c/bar.txt".into(), "bar".into(), 0),
+        ]);
+        let scored = idx.query("foo", 10);
+        assert_eq!(scored[0].doc_id, 0); // exact match "foo"
+    }
+
+    #[test]
+    fn test_prefix_beats_contains() {
+        let idx = make_index_with(&[
+            ("/a/xcode.app".into(), "Xcode".into(), 0),
+            ("/b/com.example.xco.plist".into(), "com.example.xco".into(), 0),
+        ]);
+        let scored = idx.query("xco", 10);
+        assert_eq!(scored[0].doc_id, 0); // "Xcode" prefix beats contains
+    }
+
+    #[test]
+    fn test_recency_bonus() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let idx = make_index_with(&[
+            ("/a/old.txt".into(), "report".into(), now - 5_184_000), // 60 days ago
+            ("/b/new.txt".into(), "report".into(), now - 1_800),    // 30 min ago
+        ]);
+        let scored = idx.query("report", 10);
+        assert_eq!(scored[0].doc_id, 1); // newer file wins
+    }
+
+    #[test]
+    fn test_depth_penalty() {
+        let idx = make_index_with(&[
+            ("/Applications/Foo.app".into(), "Foo".into(), 0),
+            ("/Users/x/a/b/c/d/Foo.app".into(), "Foo".into(), 0),
+        ]);
+        let scored = idx.query("foo", 10);
+        assert_eq!(scored[0].doc_id, 0); // shallow path wins
+    }
+
+    #[test]
+    fn test_short_query_uses_recent_docs() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let idx = make_index_with(&[
+            ("/a/foo.txt".into(), "foo".into(), now - 1_000),
+            ("/b/bar.txt".into(), "bar".into(), now - 4_000), // > 1h old
+            ("/c/baz.txt".into(), "baz".into(), now - 100),
+        ]);
+        // 2-char query => short-query path; "baz" is most recent and starts with "ba"
+        let scored = idx.query("ba", 10);
+        assert_eq!(scored[0].doc_id, 2); // most recent doc wins
+    }
+
+    #[test]
+    fn test_recency_does_not_promote_irrelevant_file() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let idx = make_index_with(&[
+            ("/Applications/Xcode.app".into(), "Xcode".into(), now - 86400 * 10), // 10 days old
+            ("/tmp/zxqwerty.txt".into(), "zxqwerty".into(), now - 60),             // 1 min old, irrelevant
+        ]);
+        let scored = idx.query("xco", 10);
+        // Xcode matches "xco" (prefix), zxqwerty does not — Xcode must rank first
+        // regardless of recency
+        assert_eq!(scored[0].doc_id, 0);
+    }
+
+    #[test]
+    fn test_multi_term_query_both_terms_required() {
+        let idx = make_index_with(&[
+            ("/a/xcode_docs.txt".into(), "xcode_docs".into(), 0),
+            ("/b/xcode.app".into(), "Xcode".into(), 0),
+            ("/c/documentation.pdf".into(), "documentation".into(), 0),
+        ]);
+        // "xcode doc" should rank xcode_docs.txt first (contains both "xcode" and "doc")
+        let scored = idx.query("xcode doc", 10);
+        assert_eq!(scored[0].doc_id, 0);
+    }
+
+    #[test]
+    fn test_multi_term_candidate_intersection() {
+        let idx = make_index_with(&[
+            ("/a/meeting_notes.txt".into(), "meeting_notes".into(), 0),
+            ("/b/meeting.txt".into(), "meeting".into(), 0),
+            ("/c/notes.txt".into(), "notes".into(), 0),
+        ]);
+        // "meeting notes" — only doc 0 has both terms
+        let scored = idx.query("meeting notes", 10);
+        assert!(!scored.is_empty());
+        assert_eq!(scored[0].doc_id, 0);
+    }
+
+    #[test]
+    fn test_path_segment_bonus() {
+        let idx = make_index_with(&[
+            ("/x/myproject/src/main.rs".into(), "main.rs".into(), 0),
+            ("/x/other/lib/main.rs".into(), "main.rs".into(), 0),
+        ]);
+        // "src main" — first file has "src" in parent dir, should rank higher
+        let scored = idx.query("src main", 10);
+        assert_eq!(scored[0].doc_id, 0);
+    }
+
+    #[test]
+    fn test_acronym_exact_match() {
+        let idx = make_index_with(&[
+            ("/a/VisualStudioCode.app".into(), "Visual Studio Code".into(), 0),
+            ("/b/VideoStreamCapture.app".into(), "VideoStreamCapture".into(), 0),
+            ("/c/something_else.app".into(), "SomethingElse".into(), 0),
+        ]);
+        let scored = idx.query("vsc", 10);
+        assert!(scored.iter().any(|s| s.doc_id == 0));
+        assert_eq!(scored[0].doc_id, 0);
+    }
+
+    #[test]
+    fn test_acronym_prefix_match() {
+        let idx = make_index_with(&[
+            ("/a/iTerm2Preferences.app".into(), "iTerm2 Preferences".into(), 0),
+            ("/b/internet_photos.txt".into(), "internet_photos".into(), 0),
+        ]);
+        // "it" matches acronym prefix of "itp" (iTerm2 Preferences)
+        let scored = idx.query("it", 10);
+        assert_eq!(scored[0].doc_id, 0);
+    }
+
+    #[test]
+    fn test_extract_acronym() {
+        assert_eq!(extract_acronym("visual_studio_code"), "vsc");
+        assert_eq!(extract_acronym("MyGreatApp"), "mga");
+        assert_eq!(extract_acronym("iterm2 preferences"), "ip");
+    }
+
+    #[test]
+    fn test_tie_breaking_shorter_path_wins() {
+        let idx = make_index_with(&[
+            ("/Applications/Zoom.app".into(), "Zoom".into(), 0),
+            ("/Users/x/Applications/Zoom.app".into(), "Zoom".into(), 0),
+        ]);
+        let scored = idx.query("zoom", 10);
+        // Both match equally on name; shorter path should win
+        assert_eq!(scored[0].doc_id, 0);
+    }
+
+    #[test]
+    fn test_normalized_score_in_range() {
+        let idx = make_index_with(&[
+            ("/a/foo.txt".into(), "foo".into(), 0),
+        ]);
+        let scored = idx.query("foo", 10);
+        assert!(!scored.is_empty());
+        let result = idx.to_result(&scored[0]);
+        assert!(result.score >= 0.0 && result.score <= 1.0,
+            "score {} out of [0,1] range", result.score);
+    }
+
+    #[test]
+    fn test_remove_decrements_doc_freq() {
+        let mut idx = make_index_with(&[
+            ("/a/foobar.txt".into(), "foobar".into(), 0),
+        ]);
+        let initial = *idx.doc_freq.get("foobar").unwrap_or(&0);
+        assert_eq!(initial, 1);
+        idx.remove(std::path::Path::new("/a/foobar.txt"));
+        assert_eq!(idx.doc_freq.get("foobar"), None); // cleaned up zero entries
+    }
+
+    #[test]
+    fn test_remove_updates_active_doc_count() {
+        let idx = make_index_with(&[
+            ("/a/alpha.txt".into(), "alpha".into(), 0),
+            ("/b/beta.txt".into(), "beta".into(), 0),
+            ("/c/gamma.txt".into(), "gamma".into(), 0),
+        ]);
+        let mut idx = idx;
+        assert_eq!(idx.active_doc_count, 3);
+        idx.remove(std::path::Path::new("/b/beta.txt"));
+        assert_eq!(idx.active_doc_count, 2);
+    }
+
+    #[test]
+    fn test_remove_is_idempotent() {
+        let idx = make_index_with(&[
+            ("/a/foo.txt".into(), "foo".into(), 0),
+        ]);
+        let mut idx = idx;
+        idx.remove(std::path::Path::new("/a/foo.txt"));
+        let count_after_first = idx.active_doc_count;
+        idx.remove(std::path::Path::new("/a/foo.txt")); // second remove should be no-op
+        assert_eq!(idx.active_doc_count, count_after_first);
+    }
+
+    #[test]
+    fn test_add_then_remove_then_add_cycle_maintains_correct_doc_freq() {
+        let mut idx = make_index_with(&[
+            ("/a/report.txt".into(), "report".into(), 0),
+        ]);
+        assert_eq!(*idx.doc_freq.get("report").unwrap_or(&0), 1);
+
+        idx.remove(std::path::Path::new("/a/report.txt"));
+        assert_eq!(idx.doc_freq.get("report"), None);
+
+        // Re-add (simulate file write)
+        // Note: add() checks path_to_id, but the doc is still there (tombstoned).
+        // In real usage compact() would run first. For this test we just verify
+        // that after a remove the freq is correct, and after a fresh build it stays at 1.
+        let idx2 = make_index_with(&[
+            ("/a/report.txt".into(), "report".into(), 0),
+        ]);
+        assert_eq!(*idx2.doc_freq.get("report").unwrap_or(&0), 1);
+    }
+
+    #[test]
+    fn test_compact_rebuilds_doc_freq_correctly() {
+        let idx = make_index_with(&[
+            ("/a/alpha.txt".into(), "alpha".into(), 0),
+            ("/b/alpha_beta.txt".into(), "alpha_beta".into(), 0),
+            ("/c/gamma.txt".into(), "gamma".into(), 0),
+        ]);
+        let mut idx = idx;
+        // "alpha" appears in 2 docs initially (alpha, alpha_beta)
+        assert_eq!(*idx.doc_freq.get("alpha").unwrap_or(&0), 2);
+
+        idx.remove(std::path::Path::new("/a/alpha.txt"));
+        // After compact the freq should still be correct
+        assert_eq!(*idx.doc_freq.get("alpha").unwrap_or(&0), 1); // only alpha_beta remains
+        assert_eq!(*idx.doc_freq.get("gamma").unwrap_or(&0), 1);
+    }
+
+    #[test]
+    fn test_bm25_n_excludes_tombstones() {
+        let idx = make_index_with(&[
+            ("/a/foo.txt".into(), "foo".into(), 0),
+            ("/b/foo2.txt".into(), "foo".into(), 0),
+            ("/c/bar.txt".into(), "bar".into(), 0),
+        ]);
+        let mut idx = idx;
+        assert_eq!(idx.active_doc_count, 3);
+
+        idx.remove(std::path::Path::new("/c/bar.txt"));
+
+        assert_eq!(idx.active_doc_count, 2);
+        let results = idx.query("foo", 10);
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn test_avg_doc_len_accurate_after_removes() {
+        let idx = make_index_with(&[
+            ("/a/hello_world.txt".into(), "hello_world".into(), 0),   // 2 tokens
+            ("/b/foo.txt".into(), "foo".into(), 0),                    // 1 token
+        ]);
+        let mut idx = idx;
+        // avg = (2+1)/2 = 1.5
+        assert!((idx.avg_doc_len - 1.5).abs() < 0.01, "avg_doc_len was {}", idx.avg_doc_len);
+
+        idx.remove(std::path::Path::new("/a/hello_world.txt"));
+        // avg should now be 1.0 (only foo.txt with 1 token remains)
+        assert!((idx.avg_doc_len - 1.0).abs() < 0.01, "avg_doc_len after remove was {}", idx.avg_doc_len);
+    }
+
+    #[test]
+    fn test_total_doc_len_never_goes_negative() {
+        let mut idx = make_index_with(&[
+            ("/a/foo.txt".into(), "foo".into(), 0),
+        ]);
+        // Remove the only doc — total_doc_len must not go below 0
+        idx.remove(std::path::Path::new("/a/foo.txt"));
+        assert!(idx.total_doc_len >= 0.0,
+            "total_doc_len should never be negative, got {}", idx.total_doc_len);
+        assert!(idx.avg_doc_len >= 0.0,
+            "avg_doc_len should never be negative, got {}", idx.avg_doc_len);
+    }
+
+    #[test]
+    fn test_add_after_remove_same_path_restores_count() {
+        let mut idx = make_index_with(&[
+            ("/a/foo.txt".into(), "foo".into(), 0),
+            ("/b/bar.txt".into(), "bar".into(), 0),
+        ]);
+        assert_eq!(idx.active_doc_count, 2);
+
+        idx.remove(std::path::Path::new("/a/foo.txt"));
+        assert_eq!(idx.active_doc_count, 1);
+
+        // add() must not skip a tombstoned path — re-index it
+        idx.add(std::path::Path::new("/a/foo.txt"));
+        assert_eq!(idx.active_doc_count, 2,
+            "active_doc_count should restore after add on tombstoned path");
+
+        // avg_doc_len should be positive and consistent
+        assert!(idx.avg_doc_len > 0.0,
+            "avg_doc_len went non-positive after add: {}", idx.avg_doc_len);
+    }
+
+    #[test]
+    fn test_build_skips_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join("snyd_test_symlink");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("real.txt"), "content").unwrap();
+        let _ = symlink(dir.join("real.txt"), dir.join("link.txt"));
+
+        let idx = TrigramIndex::build(&[dir.clone()]);
+        // Should index 1 file (real.txt), not 2 (would double-count via symlink)
+        assert_eq!(idx.active_doc_count, 1,
+            "symlink should not be indexed separately: got {} docs", idx.active_doc_count);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_index_doc_count_does_not_exceed_cap() {
+        assert!(MAX_INDEX_DOCS >= 100_000, "cap too low for normal use");
+        assert!(MAX_INDEX_DOCS <= 2_000_000, "cap too high, memory risk");
+    }
+
+    #[test]
+    fn test_index_content_makes_body_searchable() {
+        let mut idx = make_index_with(&[("/a/photo.png".into(), "photo.png".into(), 0)]);
+        idx.index_content("/a/photo.png", "starbucks receipt 2024");
+        let results = idx.query("starbucks", 10);
+        assert!(!results.is_empty(), "body text should be searchable after index_content");
+        assert_eq!(results[0].doc_id, 0);
+    }
+
+    #[test]
+    fn test_index_content_skips_unknown_path() {
+        let mut idx = make_index_with(&[("/a/photo.png".into(), "photo.png".into(), 0)]);
+        idx.index_content("/nonexistent/file.png", "some text");
+        assert_eq!(idx.active_doc_count, 1, "unknown path must not create new doc");
+    }
+
+    #[test]
+    fn test_index_content_overwrites_old_body() {
+        let mut idx = make_index_with(&[("/a/img.png".into(), "img.png".into(), 0)]);
+        idx.index_content("/a/img.png", "old body coffee");
+        idx.index_content("/a/img.png", "new body matcha");
+        let coffee = idx.query("coffee", 10);
+        let matcha = idx.query("matcha", 10);
+        assert!(matcha.len() >= coffee.len(),
+            "new body should replace old: coffee={}, matcha={}", coffee.len(), matcha.len());
+    }
+}

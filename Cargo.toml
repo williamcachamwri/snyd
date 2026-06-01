@@ -1,0 +1,50 @@
+[package]
+name = "snyd"
+version = "0.2.0"
+edition = "2021"
+authors = ["William Cachamwri <william@snything.app>"]
+description = "A fast trigram-indexed file search daemon with fuzzy matching and real-time filesystem watching"
+license = "MIT"
+repository = "https://github.com/williamcachamwri/snyd"
+keywords = ["search", "filesystem", "index", "trigram", "fuzzy", "daemon"]
+categories = ["filesystem", "command-line-utilities"]
+rust-version = "1.75"
+
+[lib]
+name = "snyd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "snyd"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+jwalk = "0.8"
+roaring = "0.10"
+strsim = "0.10"
+notify = "6"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+plist = "1.5"
+futures = "0.3"
+clap = { version = "4", features = ["derive", "env"] }
+directories = "5"
+dirs = "5"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+codegen-units = 1
+
+# [[bench]]
+# name = "search"
+# harness = false
