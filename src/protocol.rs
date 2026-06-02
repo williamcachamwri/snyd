@@ -29,12 +29,18 @@ fn default_tier_mask() -> u8 {
     0b001 // Tier 0 (Normal) only by default
 }
 
+fn default_max_results() -> usize {
+    20
+}
+
 /// Request sent by the Swift client over the Unix socket.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SearchRequest {
     pub id: String,
     pub query: String,
+    #[serde(default = "default_max_results")]
     pub max_results: usize,
+    #[serde(default)]
     pub scopes: Vec<String>,
     pub command: Option<String>,
     pub kind_filter: Option<String>,
