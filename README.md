@@ -169,18 +169,28 @@ xychart-beta
 
 ### How a Query Gets Answered (v0.2.4)
 
-```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  1. Parse query │────▶│ 2. Extension?    │────▶│ 3. Tokenize     │
-│                 │     │    → fast path   │     │    → trigrams   │
-└─────────────────┘     └──────────────────┘     └─────────────────┘
-         │                                                    │
-         ▼                                                    ▼
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│ 6. Return top-k │◀────│ 5. Score (BM25 + │◀────│ 4. Candidate    │
-│    results      │     │    structural +  │     │    selection    │
-│                 │     │    fuzzy penalty)│     │    (bitmap ∩)   │
-└─────────────────┘     └──────────────────┘     └─────────────────┘
+```mermaid
+flowchart LR
+    A[1. Parse query<br/>~0 µs] --> B{2. Extension?<br/>~50 µs}
+    B -->|starts with .| C[Extension scan<br/>direct field match]
+    B -->|otherwise| D[3. Tokenize<br/>~10 µs]
+    D --> E[4. Candidate selection<br/>~0.5-2 ms]
+    E --> F{< 100 candidates?}
+    F -->|yes| G[4b. Fuzzy fallback<br/>rayon parallel D-L<br/>~1-5 ms]
+    F -->|no| H[5. Scoring<br/>~1-3 ms]
+    G --> H
+    H --> I[6. Return top-k<br/>~10 µs]
+    C --> I
+
+    style A fill:#e1f5fe,stroke:#01579b
+    style B fill:#fff3e0,stroke:#e65100
+    style C fill:#e8f5e9,stroke:#2e7d32
+    style D fill:#e1f5fe,stroke:#01579b
+    style E fill:#e1f5fe,stroke:#01579b
+    style F fill:#fff3e0,stroke:#e65100
+    style G fill:#fce4ec,stroke:#c2185b
+    style H fill:#e1f5fe,stroke:#01579b
+    style I fill:#e8f5e9,stroke:#2e7d32
 ```
 
 **Stage details:**
