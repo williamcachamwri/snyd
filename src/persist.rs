@@ -7,7 +7,7 @@ use memmap2::Mmap;
 use crate::index::{DocEntry, TrigramIndex};
 use crate::protocol::ResultKind;
 
-const CACHE_VERSION: u32 = 4; // bumped for tier field
+const CACHE_VERSION: u32 = 5; // bumped for compact DocEntry v2
 const MAGIC: &[u8] = b"SNYD";
 
 /// File layout (little-endian):
@@ -55,7 +55,7 @@ struct CacheFile {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 pub fn cache_path(cache_dir: &std::path::Path) -> PathBuf {
-    cache_dir.join("index_v4.bin")
+    cache_dir.join("index_v5.bin")
 }
 
 fn build_header(scopes: &[PathBuf]) -> CacheHeader {
@@ -125,21 +125,25 @@ pub fn save(
     let docs: Vec<SerialDoc> = index
         .docs
         .iter()
-        .filter(|d| !d.deleted)
-        .map(|d| SerialDoc {
-            path: d.path.clone(),
-            name_lower: d.name_lower.clone(),
-            acronym: d.acronym.clone(),
-            tokens: d.tokens.iter().map(|s| s.to_string()).collect(),
-            body_lower: d.body_lower.clone(),
-            body_tokens: d.body_tokens.iter().map(|s| s.to_string()).collect(),
-            kind: d.kind,
-            mtime: d.mtime,
-            size: d.size,
-            extension: d.extension.clone(),
-            access_count: d.access_count,
-            last_accessed: d.last_accessed,
-            tier: d.tier.to_u8(),
+        .enumerate()
+        .filter(|(_, d)| !d.deleted)
+        .map(|(doc_id, d)| {
+            let body = index.body_store.get(&(doc_id as u32));
+            SerialDoc {
+                path: d.path.clone(),
+                name_lower: d.name_lower.to_string(),
+                acronym: d.acronym.to_string(),
+                tokens: d.tokens.iter().map(|s| s.to_string()).collect(),
+                body_lower: body.map(|b| b.body_lower.clone()).unwrap_or_default(),
+                body_tokens: body.map(|b| b.body_tokens.iter().map(|s| s.to_string()).collect()).unwrap_or_default(),
+                kind: d.kind,
+                mtime: d.mtime as u64,
+                size: d.size,
+                extension: index.ext_interner.get(d.extension_id).to_string(),
+                access_count: d.access_count,
+                last_accessed: d.last_accessed as u64,
+                tier: d.tier.to_u8(),
+            }
         })
         .collect();
 
@@ -221,28 +225,35 @@ pub fn load(_scopes: &[PathBuf], cache_dir: &std::path::Path) -> Option<TrigramI
         return None;
     }
 
-    let docs: Vec<DocEntry> = cache
-        .docs
-        .into_iter()
-        .map(|d| DocEntry {
+    let mut raw_docs: Vec<DocEntry> = Vec::with_capacity(cache.docs.len());
+    let mut body_store: std::collections::HashMap<u32, crate::index::BodyEntry> = std::collections::HashMap::new();
+
+    for (doc_id, d) in cache.docs.into_iter().enumerate() {
+        if !d.body_lower.is_empty() {
+            body_store.insert(doc_id as u32, crate::index::BodyEntry {
+                body_lower: d.body_lower,
+                body_tokens: d.body_tokens.iter().map(|s| crate::index::IStr::from(s.as_str())).collect(),
+            });
+        }
+        raw_docs.push(DocEntry {
             path: d.path,
-            name_lower: d.name_lower,
-            acronym: d.acronym,
+            name_lower: d.name_lower.into(),
+            acronym: d.acronym.into(),
             tokens: d.tokens.iter().map(|s| crate::index::IStr::from(s.as_str())).collect(),
-            body_lower: d.body_lower,
-            body_tokens: d.body_tokens.iter().map(|s| crate::index::IStr::from(s.as_str())).collect(),
             kind: d.kind,
-            mtime: d.mtime,
+            mtime: d.mtime as u32,
             size: d.size,
             deleted: false,
-            extension: d.extension,
+            extension_id: 0, // filled by from_docs
             access_count: d.access_count,
-            last_accessed: d.last_accessed,
+            last_accessed: d.last_accessed as u32,
             tier: crate::index::DocTier::from_u8(d.tier),
-        })
-        .collect();
+        });
+    }
 
-    Some(TrigramIndex::from_docs(docs))
+    let mut index = TrigramIndex::from_docs(raw_docs);
+    index.body_store = body_store;
+    Some(index)
 }
 
 #[cfg(test)]

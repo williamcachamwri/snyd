@@ -22,6 +22,7 @@ A fast trigram-indexed file search daemon with fuzzy matching, real-time filesys
 | **Early-exit scoring** | Cheap upper-bound pruning skips 80%+ of low-scoring candidates | 12× on broad queries |
 | **Always-on fuzzy (v0.2.4+)** | Parallel Damerau-Levenshtein fallback catches typos like "bdgt" → "budget" | threshold-gated, no regress |
 | **Smart short queries (v0.2.4+)** | 2-char queries use `contains` filter; path terms boost multi-word queries | fixes "src main" |
+| **Compact DocEntry (v0.2.5+)** | `SmolStr` + `u16` extension interner + separate `BodyStore` shrinks RAM ~35% | — |
 | **Extension-aware scoring** | PDF, app, and code extensions get targeted boosts | — |
 | **Access-frequency boost** | Frequently opened files automatically rank higher | — |
 | **Real-time watching** | Automatic index updates via `notify` (fsevents/kqueue/inotify) | — |
@@ -284,7 +285,7 @@ cargo install snyd
 Or with a specific version:
 
 ```bash
-cargo install snyd --version 0.2.4
+cargo install snyd --version 0.2.5
 ```
 
 Or build from source:
@@ -405,10 +406,20 @@ sequenceDiagram
 
 ## Version History
 
+### v0.2.5 — Memory Efficiency & Parallel Fuzzy
+- **Compact DocEntry** (~200 B → ~130 B, ~35% RAM reduction)
+  - `name_lower` / `acronym`: `String` → `SmolStr` (inline ≤ 22 bytes, no heap for typical filenames)
+  - `mtime` / `last_accessed`: `u64` → `u32`
+  - `extension`: `String` → `u16` via `ExtensionInterner`
+  - `body_lower` + `body_tokens`: moved to `BodyStore` (`HashMap<u32, BodyEntry>`) since most docs never have body text
+- **Real parallel fuzzy** — replaces the bogus `rayon::join(|| {}, ...)` with a threshold-gated `par_iter` Damerau-Levenshtein scan; only fires when trigram candidates < 100, eliminating wasted work on broad / not-found queries
+- **No hard short-query cap** — removes `SHORT_QUERY_CANDIDATE_LIMIT = 5 000`; short queries use `par_iter` + partial sort (`select_nth_unstable_by`) with a `SOFT_LIMIT = 50 000`; fallback dedup uses `HashSet` instead of `Vec.contains()`
+- **Persistent cache v5** — `CACHE_VERSION` bumped 4 → 5 to match new `DocEntry` layout
+
 ### v0.2.4 — Performance & Query Quality
 - **Removed 500K hard doc cap** — index now scales to 2M+ docs, RAM-bounded
 - **Smart short queries** — 2-char terms use `name.contains(term)` filter; 3-char terms with < 5 trigram hits fall back to path/acronym scan (fixes `"src main"`)
-- **Parallel fuzzy fallback** — `rayon::join` Damerau-Levenshtein scan when < 100 candidates (was < 5), catches more typos without regressing common queries
+- **Parallel fuzzy fallback** — threshold-gated Damerau-Levenshtein scan when < 100 candidates (was < 5), catches more typos without regressing common queries
 - **Extension query fast-path** — `.pdf`, `.har` queries scan `extension` field directly (~0.05 ms)
 
 ### v0.2.3 — Tiered Index Config

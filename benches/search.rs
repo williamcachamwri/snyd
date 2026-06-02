@@ -46,23 +46,16 @@ fn build_index_from_corpus(corpus: &[(String, String, u64)]) -> TrigramIndex {
     let docs: Vec<DocEntry> = corpus
         .iter()
         .map(|(path, name, mtime)| {
-            let extension = std::path::Path::new(path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
             DocEntry {
                 path: path.clone(),
-                name_lower: name.to_lowercase(),
-                acronym: String::new(),
+                name_lower: name.to_lowercase().into(),
+                acronym: smol_str::SmolStr::default(),
                 tokens: smallvec::SmallVec::new(),
-                body_lower: String::new(),
-                body_tokens: smallvec::SmallVec::new(),
                 kind: snyd::protocol::ResultKind::File,
-                mtime: *mtime,
+                mtime: *mtime as u32,
                 size: 1024,
                 deleted: false,
-                extension,
+                extension_id: 0, // filled by from_docs
                 access_count: 0,
                 last_accessed: 0,
                 tier: snyd::index::DocTier::Normal,

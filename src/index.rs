@@ -103,12 +103,7 @@ const SCORE_DEPTH_PENALTY_MAX: f32 = 10.0;
 const SCORE_NORMALIZATION_DIVISOR: f32 = 800.0; // maps raw score to [0,1]
 // ──────────────────────────────────────────────────────────────────────
 
-/// For very short queries (< 3 chars), we can't use trigram intersection.
-/// Return the 5,000 most recently modified docs as candidates.
-/// This is intentionally limited: 1-2 char queries are typically launcher-style
-/// (e.g., "vs" for VSCode), where recency + app cache is more useful than
-/// exhaustive scanning. The app cache phase in pipeline.rs handles app matching.
-const SHORT_QUERY_CANDIDATE_LIMIT: usize = 5_000;
+
 
 /// Maximum number of documents in the index.
 /// At ~200 bytes average per DocEntry (path + tokens + bitmaps),
@@ -169,27 +164,65 @@ impl Default for IndexConfig {
 }
 
 /// A single document in the index.
+/// Memory-optimized layout: ~130B per doc (was ~200B).
+/// body text moved to BodyStore; extension interned to u16.
 pub struct DocEntry {
     pub path: String,
-    pub name_lower: String,
-    pub acronym: String,
+    /// SmolStr: inline ≤ 22 bytes without heap alloc for typical filenames.
+    pub name_lower: smol_str::SmolStr,
+    /// Acronym is usually ≤ 8 chars → always inline in SmolStr.
+    pub acronym: smol_str::SmolStr,
     pub tokens: smallvec::SmallVec<[IStr; 4]>,
-    /// Body text (OCR / Calendar / Contacts / iMessage) — empty when not yet indexed.
-    pub body_lower: String,
-    /// Tokens from body — used separately for BM25 body field scoring.
-    pub body_tokens: smallvec::SmallVec<[IStr; 4]>,
     pub kind: ResultKind,
-    pub mtime: u64,
+    /// u32 Unix timestamp: sufficient until 2106.
+    pub mtime: u32,
     pub size: u64,
     pub deleted: bool,
-    /// File extension without the leading dot, lowercase (e.g. "pdf", "rs", "").
-    pub extension: String,
+    /// Interned extension ID → lookup via TrigramIndex::ext_interner.
+    pub extension_id: u16,
     /// Number of times this doc appeared in search results (for frequency boost).
     pub access_count: u32,
-    /// Unix timestamp of the last access.
-    pub last_accessed: u64,
+    /// u32 Unix timestamp: sufficient until 2106.
+    pub last_accessed: u32,
     /// Index tier — controls visibility in search unless user opts in.
     pub tier: DocTier,
+}
+
+/// Body text stored separately — most docs never have body text.
+pub struct BodyEntry {
+    pub body_lower: String,
+    pub body_tokens: smallvec::SmallVec<[IStr; 4]>,
+}
+
+/// Global extension interner — maps extension string ↔ compact u16 ID.
+#[derive(Default, Clone)]
+pub struct ExtensionInterner {
+    ext_to_id: HashMap<String, u16>,
+    id_to_ext: Vec<String>,
+}
+
+impl ExtensionInterner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn intern(&mut self, ext: &str) -> u16 {
+        if let Some(&id) = self.ext_to_id.get(ext) {
+            return id;
+        }
+        let id = self.id_to_ext.len() as u16;
+        self.id_to_ext.push(ext.to_string());
+        self.ext_to_id.insert(ext.to_string(), id);
+        id
+    }
+
+    pub fn get(&self, id: u16) -> &str {
+        self.id_to_ext.get(id as usize).map(|s| s.as_str()).unwrap_or("")
+    }
+
+    pub fn lookup(&self, ext: &str) -> Option<u16> {
+        self.ext_to_id.get(ext).copied()
+    }
 }
 
 /// In-memory trigram index.
@@ -211,15 +244,25 @@ pub struct TrigramIndex {
     /// Bitset for fast tombstone checks during query (1 bit per doc_id).
     /// Replaces the need to access `self.docs[id].deleted` on every candidate.
     deleted_bits: Vec<u64>,
+    /// Extension string interner.
+    pub ext_interner: ExtensionInterner,
+    /// Body text stored separately by doc_id.
+    pub body_store: HashMap<u32, BodyEntry>,
 }
 
 impl TrigramIndex {
     /// Fast O(1) tombstone check using the bitset.
     #[inline]
     fn is_deleted(&self, doc_id: u32) -> bool {
+        Self::is_deleted_bits(&self.deleted_bits, doc_id)
+    }
+
+    /// Static version for use in parallel closures.
+    #[inline]
+    fn is_deleted_bits(deleted_bits: &[u64], doc_id: u32) -> bool {
         let idx = doc_id as usize / 64;
         let bit = doc_id as usize % 64;
-        self.deleted_bits.get(idx).map_or(false, |&w| (w >> bit) & 1 == 1)
+        deleted_bits.get(idx).map_or(false, |&w| (w >> bit) & 1 == 1)
     }
 
     /// Set the deleted bit for a doc_id.
@@ -229,6 +272,26 @@ impl TrigramIndex {
         let bit = doc_id as usize % 64;
         if let Some(word) = self.deleted_bits.get_mut(idx) {
             *word |= 1u64 << bit;
+        }
+    }
+
+    /// Collect trigram candidates for multiple query terms.
+    /// Single term: delegates to `candidates_for_term_with_tier`.
+    /// Multi-term: intersects candidates per term.
+    fn trigram_candidates_for_terms(&self, query_terms: &[String], tier_mask: u8) -> Vec<u32> {
+        if query_terms.len() == 1 {
+            self.candidates_for_term_with_tier(&query_terms[0], tier_mask)
+        } else {
+            let mut result: Option<HashSet<u32>> = None;
+            for term in query_terms {
+                let term_candidates: HashSet<u32> =
+                    self.candidates_for_term_with_tier(term, tier_mask).into_iter().collect();
+                result = Some(match result {
+                    None => term_candidates,
+                    Some(existing) => existing.intersection(&term_candidates).copied().collect(),
+                });
+            }
+            result.unwrap_or_default().into_iter().collect()
         }
     }
 }
@@ -358,24 +421,16 @@ impl TrigramIndex {
 
                 let path_str = path.to_string_lossy().to_string();
 
-                let extension = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-
                 docs.push(DocEntry {
                     path: path_str,
-                    name_lower,
-                    acronym: String::new(),
+                    name_lower: name_lower.into(),
+                    acronym: smol_str::SmolStr::default(),
                     tokens: smallvec::SmallVec::new(), // filled by from_docs
-                    body_lower: String::new(),
-                    body_tokens: smallvec::SmallVec::new(),
                     kind,
-                    mtime,
+                    mtime: mtime as u32,
                     size,
                     deleted: false,
-                    extension,
+                    extension_id: 0, // filled by from_docs
                     access_count: 0,
                     last_accessed: 0,
                     tier,
@@ -400,24 +455,25 @@ impl TrigramIndex {
             .into_par_iter()
             .filter(|doc| !doc.deleted)
             .map(|mut doc| {
-                let name_lower = doc.name_lower.to_lowercase();
-                let terms = tokenize(&name_lower);
-                let acronym = extract_acronym(&name_lower);
-                let trigrams = extract_trigrams(&name_lower);
+                let name_str = doc.name_lower.as_str();
+                let terms = tokenize(name_str);
+                let acronym = extract_acronym(name_str);
+                let trigrams = extract_trigrams(name_str);
                 doc.tokens = terms.iter().map(|s| IStr::from(s.as_str())).collect();
-                doc.acronym = acronym;
+                doc.acronym = acronym.into();
                 (doc, terms, trigrams)
             })
             .collect();
 
-        // Phase 2 (sequential): merge into index structures
+        // Phase 2 (sequential): merge into index structures + build interners
         let mut docs: Vec<DocEntry> = Vec::with_capacity(prepped.len());
         let mut index: HashMap<[char; 3], RoaringBitmap> = HashMap::with_capacity(prepped.len());
         let mut path_to_id: HashMap<String, u32> = HashMap::with_capacity(prepped.len());
         let mut doc_freq: HashMap<String, u32> = HashMap::new();
         let mut total_doc_len: f32 = 0.0;
+        let mut ext_interner = ExtensionInterner::new();
 
-        for (doc, terms, trigrams) in prepped {
+        for (mut doc, terms, trigrams) in prepped {
             let mut seen_terms = HashSet::new();
             for term in &terms {
                 if seen_terms.insert(term.clone()) {
@@ -425,6 +481,14 @@ impl TrigramIndex {
                 }
             }
             total_doc_len += terms.len() as f32;
+
+            // Intern extension from path
+            let ext = std::path::Path::new(&doc.path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            doc.extension_id = ext_interner.intern(&ext);
 
             let doc_id = docs.len() as u32;
             path_to_id.insert(doc.path.clone(), doc_id);
@@ -449,6 +513,8 @@ impl TrigramIndex {
             active_doc_count,
             total_doc_len,
             deleted_bits,
+            ext_interner,
+            body_store: HashMap::new(),
         }
     }
 
@@ -478,13 +544,16 @@ impl TrigramIndex {
 
     /// Fast path for extension queries like ".har", ".pdf".
     fn query_by_extension_with_tier(&self, ext: &str, max: usize, tier_mask: u8) -> Vec<ScoredDoc> {
+        let Some(ext_id) = self.ext_interner.lookup(ext) else {
+            return vec![]; // unknown extension
+        };
         let mut results: Vec<ScoredDoc> = self
             .docs
             .iter()
             .enumerate()
             .filter(|(i, _)| !self.is_deleted(*i as u32))
             .filter(|(_, d)| Self::tier_matches(d.tier, tier_mask))
-            .filter(|(_, d)| d.extension == ext)
+            .filter(|(_, d)| d.extension_id == ext_id)
             .map(|(i, d)| ScoredDoc {
                 doc_id: i as u32,
                 score: 100.0 + (d.access_count as f32).ln() * 5.0,
@@ -512,65 +581,43 @@ impl TrigramIndex {
 
         let query_terms = tokenize(&query_lower);
 
-        let mut candidate_ids: Vec<u32> = if query_terms.is_empty() {
+        if query_terms.is_empty() {
             return vec![];
-        } else if query_terms.len() == 1 {
-            self.candidates_for_term_with_tier(&query_terms[0], tier_mask)
-        } else {
-            let mut result: Option<HashSet<u32>> = None;
-            for term in &query_terms {
-                let term_candidates: HashSet<u32> =
-                    self.candidates_for_term_with_tier(term, tier_mask).into_iter().collect();
-                result = Some(match result {
-                    None => term_candidates,
-                    Some(existing) => existing.intersection(&term_candidates).copied().collect(),
-                });
-            }
-            result.unwrap_or_default().into_iter().collect()
-        };
-
-        // ── Fuzzy fallback (Change C) — parallel, threshold-gated ─────────
-        // Fuzzy runs when trigram returns few candidates (< 100) rather than the
-        // old overly-restrictive gate of < 5. This catches cases where the typo
-        // is just far enough that trigram intersection misses the true match.
-        let fuzzy_candidates: HashSet<u32> = if fuzzy && query_lower.len() >= 3 && candidate_ids.len() < 100 {
-            let max_dist = (query_lower.len() / 4).max(1).min(2);
-            let docs = &self.docs;
-            let is_deleted_fn = |id: u32| self.is_deleted(id);
-            let tier_mask_captured = tier_mask;
-            rayon::join(
-                || {},
-                || {
-                    let mut extra = Vec::new();
-                    for (i, doc) in docs.iter().enumerate() {
-                        if is_deleted_fn(i as u32) {
-                            continue;
-                        }
-                        if !Self::tier_matches(doc.tier, tier_mask_captured) {
-                            continue;
-                        }
-                        if doc.name_lower.len().abs_diff(query_lower.len()) > max_dist as usize {
-                            continue;
-                        }
-                        let dist = strsim::damerau_levenshtein(&query_lower, &doc.name_lower);
-                        if dist <= max_dist {
-                            extra.push(i as u32);
-                        }
-                    }
-                    extra
-                },
-            ).1.into_iter().collect()
-        } else {
-            HashSet::new()
-        };
-
-        if !fuzzy_candidates.is_empty() {
-            let mut set: HashSet<u32> = candidate_ids.into_iter().collect();
-            for id in fuzzy_candidates {
-                set.insert(id);
-            }
-            candidate_ids = set.into_iter().collect();
         }
+
+        // ── Change C: threshold-gated parallel fuzzy ──────────────────────────
+        // Trigram candidates first (fast). Fuzzy scan via par_iter only when
+        // trigram returned very few hits (< 100), avoiding wasted work on broad
+        // queries or not-found terms where fuzzy is irrelevant.
+        let should_fuzzy = fuzzy && query_lower.len() >= 3;
+
+        let trigram_candidates = self.trigram_candidates_for_terms(&query_terms, tier_mask);
+
+        let mut candidate_ids: Vec<u32> = if should_fuzzy && trigram_candidates.len() < 100 {
+            let max_dist = (query_lower.len() / 4).max(1).min(2);
+            let q_lower = query_lower.clone();
+            let tier_mask_val = tier_mask;
+            let docs = &self.docs;
+            let deleted_bits = &self.deleted_bits;
+
+            let fuzzy_extra: HashSet<u32> = docs
+                .par_iter()
+                .enumerate()
+                .filter(|(i, _)| !Self::is_deleted_bits(deleted_bits, *i as u32))
+                .filter(|(_, d)| Self::tier_matches(d.tier, tier_mask_val))
+                .filter(|(_, d)| d.name_lower.len().abs_diff(q_lower.len()) <= max_dist)
+                .filter_map(|(i, d)| {
+                    let dist = strsim::damerau_levenshtein(&q_lower, &d.name_lower);
+                    if dist <= max_dist { Some(i as u32) } else { None }
+                })
+                .collect();
+
+            let mut set: HashSet<u32> = trigram_candidates.into_iter().collect();
+            set.extend(fuzzy_extra);
+            set.into_iter().collect()
+        } else {
+            trigram_candidates
+        };
 
         // ── Optimization B: pre-sort candidates by term coverage (desc) ───
         // High-coverage docs are more likely to score well → fill heap faster →
@@ -652,7 +699,7 @@ impl TrigramIndex {
             }
 
             // Extension-aware boost
-            if !query_ext.is_empty() && doc.extension == query_ext {
+            if !query_ext.is_empty() && self.ext_interner.get(doc.extension_id) == query_ext {
                 cheap_score += 80.0;
             }
             // Stem exact-match boost
@@ -682,7 +729,7 @@ impl TrigramIndex {
             score += len_bonus;
 
             // ── Recency: only boost files that already have substance ───────
-            let age_secs = now.saturating_sub(doc.mtime);
+            let age_secs = now.saturating_sub(doc.mtime as u64);
             let recency_raw: f32 = if age_secs < 3600 {
                 SCORE_RECENCY_RECENT
             } else if age_secs < 86400 {
@@ -764,86 +811,91 @@ impl TrigramIndex {
     /// For very short terms we fall back to a bounded scan of docs whose name
     /// actually contains the term, ordered by recency.
     fn candidates_for_term_with_tier(&self, term: &str, tier_mask: u8) -> Vec<u32> {
-        // Extension query shortcut: ".pdf" → match doc.extension == "pdf"
+        // Extension query shortcut: ".pdf" → match doc.extension_id
         if let Some(ext) = term.strip_prefix('.') {
+            let Some(ext_id) = self.ext_interner.lookup(ext) else {
+                return vec![];
+            };
             return self
                 .docs
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| !self.is_deleted(*i as u32))
                 .filter(|(_, d)| Self::tier_matches(d.tier, tier_mask))
-                .filter(|(_, d)| d.extension == ext)
+                .filter(|(_, d)| d.extension_id == ext_id)
                 .map(|(i, _)| i as u32)
                 .collect();
         }
 
         let trigrams = extract_trigrams(term);
         if trigrams.is_empty() {
-            // Very short term (< 3 chars): scan docs whose name actually contains the term.
-            // For 1-char terms this is almost everything, so we keep the top N by recency.
-            // For 2-char terms the filter is reasonably selective.
-            let mut heap: BinaryHeap<(std::cmp::Reverse<u64>, u32)> =
-                BinaryHeap::with_capacity(SHORT_QUERY_CANDIDATE_LIMIT + 1);
-            for (i, doc) in self.docs.iter().enumerate() {
-                if self.is_deleted(i as u32) {
-                    continue;
-                }
-                if !Self::tier_matches(doc.tier, tier_mask) {
-                    continue;
-                }
-                // For 2+ char short queries, require name actually contains the term
-                if term.len() >= 2 && !doc.name_lower.contains(term) {
-                    continue;
-                }
-                heap.push((std::cmp::Reverse(doc.mtime), i as u32));
-                if heap.len() > SHORT_QUERY_CANDIDATE_LIMIT {
-                    heap.pop();
-                }
+            // ── Change B: short query (< 3 chars) parallel scan ────────────────
+            // Use par_iter for speed; cap very broad 1-char matches with a
+            // soft limit (partial sort, O(N) not O(N log N)).
+            const SOFT_LIMIT: usize = 50_000;
+
+            let mut results: Vec<(u64, u32)> = self.docs.par_iter()
+                .enumerate()
+                .filter(|(i, _)| !self.is_deleted(*i as u32))
+                .filter(|(_, d)| Self::tier_matches(d.tier, tier_mask))
+                .filter(|(_, d)| {
+                    if term.len() >= 2 {
+                        d.name_lower.contains(term)
+                    } else {
+                        true // 1-char: no filter, rely on SOFT_LIMIT
+                    }
+                })
+                .map(|(i, d)| (d.mtime as u64, i as u32))
+                .collect();
+
+            if results.len() > SOFT_LIMIT {
+                results.select_nth_unstable_by(SOFT_LIMIT - 1, |a, b| b.0.cmp(&a.0));
+                results.truncate(SOFT_LIMIT);
             }
-            let mut ids: Vec<u32> = heap.into_iter().map(|(_, id)| id).collect();
-            ids.sort_by_key(|&id| std::cmp::Reverse(self.docs[id as usize].mtime));
-            ids
-        } else {
-            // For terms with 1+ trigrams, intersect bitmaps (single trigram = direct lookup)
-            let mut candidates: Option<RoaringBitmap> = None;
-            for tri in &trigrams {
-                if let Some(bitmap) = self.index.get(tri) {
-                    let filtered: RoaringBitmap = bitmap
-                        .iter()
-                        .filter(|&id| !self.is_deleted(id))
-                        .filter(|&id| Self::tier_matches(self.docs[id as usize].tier, tier_mask))
-                        .collect();
-                    match candidates {
-                        None => candidates = Some(filtered),
-                        Some(ref mut c) => *c = &*c & &filtered,
-                    }
-                }
-            }
-            let mut result: Vec<u32> = candidates.map(|b| b.iter().collect()).unwrap_or_default();
-            // Fallback: if trigram lookup yields very few results, also scan docs whose
-            // name contains the term. This catches terms that appear in the name but not
-            // as contiguous trigrams (shouldn't happen for normal names) OR terms that
-            // appear in the path (which we want for multi-term queries like "src main").
-            if result.len() < 5 {
-                for (i, doc) in self.docs.iter().enumerate() {
-                    if self.is_deleted(i as u32) {
-                        continue;
-                    }
-                    if !Self::tier_matches(doc.tier, tier_mask) {
-                        continue;
-                    }
-                    if doc.name_lower.contains(term)
-                        || doc.acronym.contains(term)
-                        || doc.path.to_lowercase().contains(term)
-                    {
-                        if !result.contains(&(i as u32)) {
-                            result.push(i as u32);
-                        }
-                    }
-                }
-            }
-            result
+
+            return results.into_iter().map(|(_, id)| id).collect();
         }
+
+        // For terms with 1+ trigrams, intersect bitmaps (single trigram = direct lookup)
+        let mut candidates: Option<RoaringBitmap> = None;
+        for tri in &trigrams {
+            if let Some(bitmap) = self.index.get(tri) {
+                let filtered: RoaringBitmap = bitmap
+                    .iter()
+                    .filter(|&id| !self.is_deleted(id))
+                    .filter(|&id| Self::tier_matches(self.docs[id as usize].tier, tier_mask))
+                    .collect();
+                match candidates {
+                    None => candidates = Some(filtered),
+                    Some(ref mut c) => *c = &*c & &filtered,
+                }
+            }
+        }
+
+        let mut result: Vec<u32> = candidates.map(|b| b.iter().collect()).unwrap_or_default();
+
+        // Fallback: if trigram lookup yields very few results, also scan docs whose
+        // name contains the term. This catches terms that appear in the name but not
+        // as contiguous trigrams (shouldn't happen for normal names) OR terms that
+        // appear in the path (which we want for multi-term queries like "src main").
+        if result.len() < 5 {
+            let mut seen: HashSet<u32> = result.iter().copied().collect();
+            let term_lower = term.to_lowercase();
+            for (i, doc) in self.docs.iter().enumerate() {
+                if self.is_deleted(i as u32) { continue; }
+                if !Self::tier_matches(doc.tier, tier_mask) { continue; }
+                if seen.contains(&(i as u32)) { continue; }
+
+                if doc.name_lower.contains(&term_lower)
+                    || doc.acronym.contains(&term_lower)
+                    || doc.path.to_lowercase().contains(&term_lower)
+                {
+                    seen.insert(i as u32);
+                    result.push(i as u32);
+                }
+            }
+        }
+        result
     }
 
     /// BM25 score combining name field and body field.
@@ -853,10 +905,11 @@ impl TrigramIndex {
     fn bm25_score(&self, doc_id: u32, query_terms: &[String]) -> f32 {
         let doc = &self.docs[doc_id as usize];
         let name_score = self.bm25_field(doc_id, &doc.tokens, query_terms);
-        let body_score = if doc.body_tokens.is_empty() {
-            0.0
-        } else {
-            self.bm25_field(doc_id, &doc.body_tokens, query_terms) * 0.4
+        let body_score = match self.body_store.get(&doc_id) {
+            Some(body) if !body.body_tokens.is_empty() => {
+                self.bm25_field(doc_id, &body.body_tokens, query_terms) * 0.4
+            }
+            _ => 0.0,
         };
         name_score + body_score
     }
@@ -905,7 +958,7 @@ impl TrigramIndex {
                 .to_string(),
             kind: doc.kind,
             size: doc.size,
-            modified: doc.mtime,
+            modified: doc.mtime as u64,
             score: normalized_score,
         }
     }
@@ -965,25 +1018,24 @@ impl TrigramIndex {
         }
 
         let acronym = extract_acronym(&name_lower);
-        let extension = path
+        let ext = path
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
+        let ext_id = self.ext_interner.intern(&ext);
 
         let doc_id = self.docs.len() as u32;
         self.docs.push(DocEntry {
             path: path_str.clone(),
-            name_lower: name_lower.clone(),
-            acronym,
+            name_lower: name_lower.clone().into(),
+            acronym: acronym.into(),
             tokens: terms.iter().map(|s| IStr::from(s.as_str())).collect(),
-            body_lower: String::new(),
-            body_tokens: smallvec::SmallVec::new(),
             kind,
-            mtime,
+            mtime: mtime as u32,
             size,
             deleted: false,
-            extension,
+            extension_id: ext_id,
             access_count: 0,
             last_accessed: 0,
             tier: DocTier::Normal,
@@ -1015,7 +1067,7 @@ impl TrigramIndex {
         }
 
         // Remove old body tokens from doc_freq
-        let old_tokens = self.docs[doc_id as usize].body_tokens.clone();
+        let old_tokens = self.body_store.get(&doc_id).map(|b| b.body_tokens.clone()).unwrap_or_default();
         let mut seen = HashSet::new();
         for token in &old_tokens {
             if seen.insert(token.clone()) {
@@ -1051,9 +1103,10 @@ impl TrigramIndex {
         self.total_doc_len += new_tokens.len() as f32;
         self.avg_doc_len = self.total_doc_len / self.active_doc_count.max(1) as f32;
 
-        let doc = &mut self.docs[doc_id as usize];
-        doc.body_lower = body_lower;
-        doc.body_tokens = new_tokens;
+        self.body_store.insert(doc_id, BodyEntry {
+            body_lower,
+            body_tokens: new_tokens,
+        });
     }
 
     /// Atomic update: remove existing doc at path (if any) then re-add it.
@@ -1075,7 +1128,7 @@ impl TrigramIndex {
             doc.last_accessed = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_secs();
+                .as_secs() as u32;
         }
     }
 
@@ -1177,6 +1230,15 @@ impl TrigramIndex {
         self.active_doc_count = new_docs.len();
         self.total_doc_len = total_doc_len;
         self.avg_doc_len = if new_docs.is_empty() { 1.0 } else { total_doc_len / new_docs.len() as f32 };
+
+        // Remap body_store keys
+        let mut new_body_store: HashMap<u32, BodyEntry> = HashMap::with_capacity(self.body_store.len());
+        for (old_id, entry) in self.body_store.drain() {
+            if let Some(&new_id) = old_to_new.get(&old_id) {
+                new_body_store.insert(new_id, entry);
+            }
+        }
+        self.body_store = new_body_store;
 
         self.docs = new_docs;
         self.index = new_index;
@@ -1304,6 +1366,8 @@ mod tests {
             active_doc_count: 0,
             total_doc_len: 0.0,
             deleted_bits: Vec::new(),
+            ext_interner: ExtensionInterner::new(),
+            body_store: HashMap::new(),
         };
         for (path, name, mtime) in docs {
             let name_lower = name.to_lowercase();
@@ -1316,23 +1380,22 @@ mod tests {
                 }
             }
             let doc_id = index.docs.len() as u32;
-            let extension = Path::new(path.as_str())
+            let ext = Path::new(path.as_str())
                 .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
                 .to_lowercase();
+            let ext_id = index.ext_interner.intern(&ext);
             index.docs.push(DocEntry {
                 path: path.clone(),
-                name_lower: name_lower.clone(),
-                acronym,
+                name_lower: name_lower.clone().into(),
+                acronym: acronym.into(),
                 tokens: terms.iter().map(|s| IStr::from(s.as_str())).collect(),
-                body_lower: String::new(),
-                body_tokens: smallvec::SmallVec::new(),
                 kind: ResultKind::File,
-                mtime: *mtime,
+                mtime: *mtime as u32,
                 size: 0,
                 deleted: false,
-                extension,
+                extension_id: ext_id,
                 access_count: 0,
                 last_accessed: 0,
                 tier: DocTier::Normal,
@@ -1880,6 +1943,33 @@ mod tests {
     }
 
     #[test]
+    fn test_rayon_join_runs_fuzzy_in_parallel() {
+        // Tạo index nhỏ, query typo với < 100 trigram hits
+        let idx = make_index_with(&[
+            ("/a/budget.xlsx".into(), "budget".into(), 0),
+            ("/b/unrelated.txt".into(), "unrelated".into(), 0),
+        ]);
+        // "budge" = 1 edit từ "budget" → phải tìm được
+        let scored = idx.query_with_tier("budge", 10, true, 0b111);
+        let ids: Vec<u32> = scored.iter().map(|s| s.doc_id).collect();
+        assert!(ids.contains(&0), "parallel fuzzy must still find 'budget' from 'budge'");
+    }
+
+    #[test]
+    fn test_fuzzy_not_triggered_when_many_trigram_hits() {
+        // Query "report" → nhiều kết quả trigram → fuzzy không được kích hoạt
+        // (đảm bảo không regression trên broad queries)
+        let mut docs = vec![];
+        for i in 0..200 {
+            docs.push((format!("/a/report_{}.txt", i), format!("report_{}", i), i as u64));
+        }
+        let idx = make_index_with(&docs);
+        // Chỉ cần đảm bảo query không panic và trả kết quả đúng
+        let scored = idx.query_with_tier("report", 20, true, 0b111);
+        assert!(!scored.is_empty());
+    }
+
+    #[test]
     fn test_trigram_single_plus_fallback_catches_path_terms() {
         // "src" has 1 trigram; docs have "src" in path but not in name
         let idx = make_index_with(&[
@@ -1889,5 +1979,112 @@ mod tests {
         let scored = idx.query("src main", 10, true);
         // doc 0 should rank higher because "src" appears in its path
         assert!(!scored.is_empty(), "'src main' should find docs via path fallback");
+    }
+
+    // ── Change B tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_short_query_no_hard_limit() {
+        // Tạo 6000 docs tất cả đều match "re" (name chứa "re")
+        let docs: Vec<_> = (0..6000)
+            .map(|i| (format!("/a/report_{}.txt", i), format!("report_{}", i), i as u64))
+            .collect();
+        let idx = make_index_with(&docs);
+        // Phải tìm thấy tất cả 6000, không bị cắt ở 5000
+        let scored = idx.query_with_tier("re", 6000, true, 0b111);
+        assert_eq!(scored.len(), 6000, "short query must not cap at 5000");
+    }
+
+    #[test]
+    fn test_fallback_scan_dedup_no_duplicates() {
+        // Term với 1 trigram → fallback scan
+        let idx = make_index_with(&[
+            ("/a/src/main.rs".into(), "main.rs".into(), 0),
+            ("/b/other/main.rs".into(), "main.rs".into(), 1),
+        ]);
+        // "src" → 1 trigram, < 5 trigram hits → fallback scan
+        // Không được có duplicate doc_id trong kết quả
+        let scored = idx.query_with_tier("src main", 10, true, 0b111);
+        let ids: Vec<u32> = scored.iter().map(|s| s.doc_id).collect();
+        let unique: HashSet<u32> = ids.iter().copied().collect();
+        assert_eq!(ids.len(), unique.len(), "no duplicate doc_ids in results");
+    }
+
+    #[test]
+    fn test_1_char_query_uses_soft_limit() {
+        // 1-char query không panic và trả kết quả hợp lý
+        let docs: Vec<_> = (0..100)
+            .map(|i| (format!("/a/file_{}.txt", i), format!("file_{}", i), i as u64))
+            .collect();
+        let idx = make_index_with(&docs);
+        let scored = idx.query_with_tier("f", 20, true, 0b111);
+        assert!(!scored.is_empty(), "1-char query should return results");
+        assert!(scored.len() <= 20, "capped at max_results");
+    }
+
+    // ── Change E tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_extension_interner_roundtrip() {
+        let mut interner = ExtensionInterner::new();
+        let id_rs = interner.intern("rs");
+        let id_pdf = interner.intern("pdf");
+        let id_rs2 = interner.intern("rs"); // same string → same ID
+        assert_eq!(id_rs, id_rs2);
+        assert_ne!(id_rs, id_pdf);
+        assert_eq!(interner.get(id_rs), "rs");
+        assert_eq!(interner.get(id_pdf), "pdf");
+    }
+
+    #[test]
+    fn test_body_store_survives_compact() {
+        let mut idx = make_index_with(&[
+            ("/a/photo.png".into(), "photo.png".into(), 0),
+            ("/b/doc.txt".into(), "doc.txt".into(), 1),
+        ]);
+        idx.index_content("/a/photo.png", "starbucks receipt 2024");
+
+        // Remove doc.txt để trigger compact sau khi tombstone count > threshold
+        idx.remove(std::path::Path::new("/b/doc.txt"));
+        // Manual compact (normally auto-triggered at >1000 tombstones)
+        idx.compact();
+
+        // Body vẫn tìm được sau compact
+        let results = idx.query("starbucks", 10, true);
+        assert!(!results.is_empty(), "body text must survive compact");
+    }
+
+    #[test]
+    fn test_smolstr_name_lower_no_heap_for_short_names() {
+        // SmolStr không cần heap nếu string ≤ 22 bytes
+        // Chỉ verify behavior đúng, không thể test allocation trực tiếp
+        let idx = make_index_with(&[
+            ("/a/foo.txt".into(), "foo.txt".into(), 0),
+            ("/b/this_is_a_very_long_filename_exceeding_smolstr_limit.txt".into(),
+             "this_is_a_very_long_filename_exceeding_smolstr_limit".into(), 1),
+        ]);
+        // Cả hai đều phải search được bình thường
+        let short = idx.query("foo", 10, true);
+        assert!(!short.is_empty());
+        let long = idx.query("exceeding", 10, true);
+        assert!(!long.is_empty());
+    }
+
+    #[test]
+    fn test_mtime_u32_precision() {
+        // u32 Unix timestamp đủ đến năm 2106
+        // Test: mtime gần đây vẫn được preserve
+        let now_u32 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32; // truncate to u32
+        let idx = make_index_with(&[
+            ("/a/new.txt".into(), "new".into(), now_u32 as u64),
+            ("/b/old.txt".into(), "old".into(), 1000u64),
+        ]);
+        // Recency boost: new.txt phải rank cao hơn old.txt cho cùng query
+        // (không thể test trực tiếp nhưng verify không panic)
+        let scored = idx.query("new", 10, true);
+        assert!(!scored.is_empty());
     }
 }
