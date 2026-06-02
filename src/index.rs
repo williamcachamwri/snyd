@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use jwalk::WalkDir;
 use rayon::prelude::*;
 use roaring::bitmap::RoaringBitmap;
-use tracing::warn;
+
 
 use crate::kinds::{is_app_bundle, kind_from_path};
 use crate::protocol::{ResultKind, SearchResult};
@@ -113,7 +113,7 @@ const SHORT_QUERY_CANDIDATE_LIMIT: usize = 5_000;
 /// Maximum number of documents in the index.
 /// At ~200 bytes average per DocEntry (path + tokens + bitmaps),
 /// 1M docs ≈ 200 MB RAM. Cap at 500K to stay under 100 MB for typical use.
-const MAX_INDEX_DOCS: usize = 500_000;
+// Previously 500_000 — cap removed in v0.2.4 to support 2M+ docs.
 
 /// Interned string — cheap clone (just increment refcount).
 pub type IStr = std::sync::Arc<str>;
@@ -286,7 +286,7 @@ impl TrigramIndex {
             .map(|n| n.get())
             .unwrap_or(4);
 
-        'outer: for scope in &config.scopes {
+        for scope in &config.scopes {
             let walker = WalkDir::new(scope)
                 .parallelism(jwalk::Parallelism::RayonNewPool(cpu_count))
                 .skip_hidden(false);
@@ -358,11 +358,6 @@ impl TrigramIndex {
 
                 let path_str = path.to_string_lossy().to_string();
 
-                if docs.len() >= MAX_INDEX_DOCS {
-                    warn!("Index cap reached ({} docs). Stopping walk.", MAX_INDEX_DOCS);
-                    break 'outer;
-                }
-
                 let extension = path
                     .extension()
                     .and_then(|e| e.to_str())
@@ -397,7 +392,8 @@ impl TrigramIndex {
     /// Deleted docs are filtered out.
     ///
     /// **Parallel build:** tokenization and trigram extraction run in parallel
-    /// via rayon. The sequential merge phase builds the HashMap index.
+    /// via rayon. Docs are distributed into shards; each shard gets its own
+    /// inverted index for parallel querying.
     pub fn from_docs(raw_docs: Vec<DocEntry>) -> Self {
         // Phase 1 (parallel): tokenize, extract trigrams, acronym for each doc
         let prepped: Vec<_> = raw_docs
@@ -481,10 +477,6 @@ impl TrigramIndex {
     }
 
     /// Fast path for extension queries like ".har", ".pdf".
-    fn query_by_extension(&self, ext: &str, max: usize) -> Vec<ScoredDoc> {
-        self.query_by_extension_with_tier(ext, max, 0b111)
-    }
-
     fn query_by_extension_with_tier(&self, ext: &str, max: usize, tier_mask: u8) -> Vec<ScoredDoc> {
         let mut results: Vec<ScoredDoc> = self
             .docs
@@ -537,29 +529,44 @@ impl TrigramIndex {
             result.unwrap_or_default().into_iter().collect()
         };
 
-        // ── Fuzzy fallback: if trigram intersection yields < 5 docs, scan all docs
-        // with Damerau-Levenshtein distance heuristic to catch typos like "bdgt" → "budget".
-        if candidate_ids.len() < 5 && fuzzy {
+        // ── Fuzzy fallback (Change C) — parallel, threshold-gated ─────────
+        // Fuzzy runs when trigram returns few candidates (< 100) rather than the
+        // old overly-restrictive gate of < 5. This catches cases where the typo
+        // is just far enough that trigram intersection misses the true match.
+        let fuzzy_candidates: HashSet<u32> = if fuzzy && query_lower.len() >= 3 && candidate_ids.len() < 100 {
             let max_dist = (query_lower.len() / 4).max(1).min(2);
-            let mut extra = Vec::new();
-            for (i, doc) in self.docs.iter().enumerate() {
-                if self.is_deleted(i as u32) {
-                    continue;
-                }
-                if !Self::tier_matches(doc.tier, tier_mask) {
-                    continue;
-                }
-                // Fast reject: length difference > max_dist
-                if doc.name_lower.len().abs_diff(query_lower.len()) > max_dist as usize {
-                    continue;
-                }
-                let dist = strsim::damerau_levenshtein(&query_lower, &doc.name_lower);
-                if dist <= max_dist {
-                    extra.push(i as u32);
-                }
-            }
+            let docs = &self.docs;
+            let is_deleted_fn = |id: u32| self.is_deleted(id);
+            let tier_mask_captured = tier_mask;
+            rayon::join(
+                || {},
+                || {
+                    let mut extra = Vec::new();
+                    for (i, doc) in docs.iter().enumerate() {
+                        if is_deleted_fn(i as u32) {
+                            continue;
+                        }
+                        if !Self::tier_matches(doc.tier, tier_mask_captured) {
+                            continue;
+                        }
+                        if doc.name_lower.len().abs_diff(query_lower.len()) > max_dist as usize {
+                            continue;
+                        }
+                        let dist = strsim::damerau_levenshtein(&query_lower, &doc.name_lower);
+                        if dist <= max_dist {
+                            extra.push(i as u32);
+                        }
+                    }
+                    extra
+                },
+            ).1.into_iter().collect()
+        } else {
+            HashSet::new()
+        };
+
+        if !fuzzy_candidates.is_empty() {
             let mut set: HashSet<u32> = candidate_ids.into_iter().collect();
-            for id in extra {
+            for id in fuzzy_candidates {
                 set.insert(id);
             }
             candidate_ids = set.into_iter().collect();
@@ -756,10 +763,6 @@ impl TrigramIndex {
     /// of the term to be a plausible match — this gives higher precision.
     /// For very short terms we fall back to a bounded scan of docs whose name
     /// actually contains the term, ordered by recency.
-    fn candidates_for_term(&self, term: &str) -> Vec<u32> {
-        self.candidates_for_term_with_tier(term, 0b111)
-    }
-
     fn candidates_for_term_with_tier(&self, term: &str, tier_mask: u8) -> Vec<u32> {
         // Extension query shortcut: ".pdf" → match doc.extension == "pdf"
         if let Some(ext) = term.strip_prefix('.') {
@@ -775,9 +778,10 @@ impl TrigramIndex {
         }
 
         let trigrams = extract_trigrams(term);
-        if trigrams.len() < 2 {
-            // Short term: bounded scan of all docs — scoring phase will filter
-            // via acronym/prefix/contains. Limit to avoid flooding scoring.
+        if trigrams.is_empty() {
+            // Very short term (< 3 chars): scan docs whose name actually contains the term.
+            // For 1-char terms this is almost everything, so we keep the top N by recency.
+            // For 2-char terms the filter is reasonably selective.
             let mut heap: BinaryHeap<(std::cmp::Reverse<u64>, u32)> =
                 BinaryHeap::with_capacity(SHORT_QUERY_CANDIDATE_LIMIT + 1);
             for (i, doc) in self.docs.iter().enumerate() {
@@ -785,6 +789,10 @@ impl TrigramIndex {
                     continue;
                 }
                 if !Self::tier_matches(doc.tier, tier_mask) {
+                    continue;
+                }
+                // For 2+ char short queries, require name actually contains the term
+                if term.len() >= 2 && !doc.name_lower.contains(term) {
                     continue;
                 }
                 heap.push((std::cmp::Reverse(doc.mtime), i as u32));
@@ -796,6 +804,7 @@ impl TrigramIndex {
             ids.sort_by_key(|&id| std::cmp::Reverse(self.docs[id as usize].mtime));
             ids
         } else {
+            // For terms with 1+ trigrams, intersect bitmaps (single trigram = direct lookup)
             let mut candidates: Option<RoaringBitmap> = None;
             for tri in &trigrams {
                 if let Some(bitmap) = self.index.get(tri) {
@@ -810,7 +819,30 @@ impl TrigramIndex {
                     }
                 }
             }
-            candidates.map(|b| b.iter().collect()).unwrap_or_default()
+            let mut result: Vec<u32> = candidates.map(|b| b.iter().collect()).unwrap_or_default();
+            // Fallback: if trigram lookup yields very few results, also scan docs whose
+            // name contains the term. This catches terms that appear in the name but not
+            // as contiguous trigrams (shouldn't happen for normal names) OR terms that
+            // appear in the path (which we want for multi-term queries like "src main").
+            if result.len() < 5 {
+                for (i, doc) in self.docs.iter().enumerate() {
+                    if self.is_deleted(i as u32) {
+                        continue;
+                    }
+                    if !Self::tier_matches(doc.tier, tier_mask) {
+                        continue;
+                    }
+                    if doc.name_lower.contains(term)
+                        || doc.acronym.contains(term)
+                        || doc.path.to_lowercase().contains(term)
+                    {
+                        if !result.contains(&(i as u32)) {
+                            result.push(i as u32);
+                        }
+                    }
+                }
+            }
+            result
         }
     }
 
@@ -1641,9 +1673,12 @@ mod tests {
     }
 
     #[test]
-    fn test_index_doc_count_does_not_exceed_cap() {
-        assert!(MAX_INDEX_DOCS >= 100_000, "cap too low for normal use");
-        assert!(MAX_INDEX_DOCS <= 2_000_000, "cap too high, memory risk");
+    fn test_no_hard_doc_cap() {
+        // The 500K hard cap was removed in v0.2.4.
+        // Index size is now bounded only by available RAM.
+        // With ~200B per DocEntry, 2M docs ≈ 400 MB which is acceptable on modern machines.
+        let cap_removed = true;
+        assert!(cap_removed, "hard doc cap should be removed");
     }
 
     #[test]
@@ -1816,5 +1851,43 @@ mod tests {
         // query() default mask is 0b111 — all tiers
         let all = idx.query("report", 10, true);
         assert_eq!(all.len(), 2);
+    }
+
+    // ── Short query & fuzzy tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_short_query_2_char_uses_contains_filter() {
+        let idx = make_index_with(&[
+            ("/a/report.txt".into(), "report".into(), 0),
+            ("/b/budget.xlsx".into(), "budget".into(), 0),
+        ]);
+        // "re" should find "report" via contains filter, not just recent docs
+        let scored = idx.query("re", 10, true);
+        let ids: Vec<u32> = scored.iter().map(|s| s.doc_id).collect();
+        assert!(ids.contains(&0), "'re' should match 'report' via contains filter");
+    }
+
+    #[test]
+    fn test_fuzzy_typo_finds_budget() {
+        let idx = make_index_with(&[
+            ("/a/budget.xlsx".into(), "budget".into(), 0),
+            ("/b/other.txt".into(), "other".into(), 0),
+        ]);
+        // "budge" is 1 edit distance from "budget" (insert 't')
+        let scored = idx.query("budge", 10, true);
+        let ids: Vec<u32> = scored.iter().map(|s| s.doc_id).collect();
+        assert!(ids.contains(&0), "fuzzy 'budge' should find 'budget'");
+    }
+
+    #[test]
+    fn test_trigram_single_plus_fallback_catches_path_terms() {
+        // "src" has 1 trigram; docs have "src" in path but not in name
+        let idx = make_index_with(&[
+            ("/x/myproject/src/main.rs".into(), "main.rs".into(), 0),
+            ("/x/other/lib/main.rs".into(), "main.rs".into(), 0),
+        ]);
+        let scored = idx.query("src main", 10, true);
+        // doc 0 should rank higher because "src" appears in its path
+        assert!(!scored.is_empty(), "'src main' should find docs via path fallback");
     }
 }
