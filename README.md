@@ -285,7 +285,7 @@ cargo install snyd
 Or with a specific version:
 
 ```bash
-cargo install snyd --version 0.2.5
+cargo install snyd --version 0.2.6
 ```
 
 Or build from source:
@@ -405,6 +405,9 @@ sequenceDiagram
 ```
 
 ## Version History
+
+### v0.2.6 — Protocol Fix
+- **`SearchRequest` defaults** — `scopes` and `max_results` now have `#[serde(default)]`, so minimal requests like `{"id":"1","query":"budget"}` work without "invalid request" errors
 
 ### v0.2.5 — Memory Efficiency & Parallel Fuzzy
 - **Compact DocEntry** (~200 B → ~130 B, ~35% RAM reduction)
