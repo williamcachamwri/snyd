@@ -196,7 +196,7 @@ impl SearchPipeline {
             let index_results = {
                 let idx = index.read().await;
                 let fetch_max = if is_app_only { max_results * 3 } else { max_results };
-                let scored = idx.query(&query, fetch_max, req.fuzzy);
+                let scored = idx.query_with_tier(&query, fetch_max, req.fuzzy, req.tier_mask);
                 scored
                     .into_iter()
                     .map(|s| idx.to_result(&s))
@@ -354,6 +354,7 @@ mod tests {
             kind_filter: None,
             content_batch: vec![],
             fuzzy: true,
+            tier_mask: 0b111,
         };
 
         let mut rx = pipeline.search(req).await;
@@ -386,6 +387,7 @@ mod tests {
             kind_filter: None,
             content_batch: vec![],
             fuzzy: true,
+            tier_mask: 0b111,
         };
         let mut rx = pipeline.search(req).await;
         let batch = rx.recv().await.expect("should receive done batch");
@@ -415,6 +417,7 @@ mod tests {
             kind_filter: Some("application".into()),
             content_batch: vec![],
             fuzzy: true,
+            tier_mask: 0b111,
         };
         let mut rx = pipeline.search(req).await;
         let mut all_results = vec![];
@@ -456,6 +459,7 @@ mod tests {
                     kind_filter: None,
                     content_batch: vec![],
                     fuzzy: true,
+                    tier_mask: 0b111,
                 };
                 let mut rx = p.search(req).await;
                 let mut got_done = false;
@@ -530,6 +534,7 @@ mod tests {
                         kind_filter: None,
                         content_batch: vec![],
                         fuzzy: true,
+                        tier_mask: 0b111,
                     };
                     let mut rx = p.search(req).await;
                     let result = timeout(Duration::from_secs(3), async {
@@ -643,6 +648,7 @@ mod tests {
                     kind_filter: None,
                     content_batch: vec![],
                     fuzzy: true,
+                    tier_mask: 0b111,
                 };
                 let mut rx = pipeline.search(req).await;
                 let result = timeout(Duration::from_secs(5), async {

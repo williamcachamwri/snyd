@@ -50,6 +50,10 @@ pub struct Config {
     pub app_dirs: Vec<PathBuf>,
     /// Cache directory for the persisted index.
     pub cache_dir: PathBuf,
+    /// Index hidden files and dot-directories.
+    pub index_hidden: bool,
+    /// Index cache and build directories.
+    pub index_cache: bool,
 }
 
 impl Default for Config {
@@ -68,6 +72,8 @@ impl Default for Config {
             socket_path: cache.join("snyd.sock"),
             app_dirs: vec![],
             cache_dir: cache,
+            index_hidden: false,
+            index_cache: false,
         }
     }
 }
@@ -83,6 +89,14 @@ pub struct DaemonState {
 pub async fn build_state(config: &Config) -> DaemonState {
     use tracing::{info, warn};
 
+    let index_config = crate::index::IndexConfig {
+        scopes: config.scopes.clone(),
+        index_hidden: config.index_hidden,
+        index_cache: config.index_cache,
+        custom_excludes: vec![],
+        custom_includes: vec![],
+    };
+
     let index: Arc<RwLock<TrigramIndex>> = match persist::load(&config.scopes, &config.cache_dir) {
         Some(cached) => {
             info!(
@@ -95,7 +109,7 @@ pub async fn build_state(config: &Config) -> DaemonState {
         None => {
             let start = std::time::Instant::now();
             info!("Building trigram index for {} scopes…", config.scopes.len());
-            let idx = TrigramIndex::build(&config.scopes);
+            let idx = TrigramIndex::build_with_config(&index_config);
             let build_time = start.elapsed();
             info!(
                 "Index built in {:?}: {} docs, {} unique trigrams",

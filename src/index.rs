@@ -12,6 +12,71 @@ use crate::protocol::{ResultKind, SearchResult};
 const K1: f32 = 1.2;
 const B: f32 = 0.75;
 
+// ── Cache / hidden path classification patterns ────────────────────────────
+const CACHE_PATTERNS: &[&str] = &[
+    "/.cargo/registry",
+    "/Library/Caches",
+    "/Library/Developer/Xcode/DerivedData",
+    "/Library/Developer/CoreSimulator",
+    "/.npm",
+    "/.pnpm-store",
+    "/go/pkg/mod",
+    "/.gradle",
+    "/.m2/repository",
+    "/node_modules/",
+    "/vendor/",
+    "/__pycache__",
+    "/.pytest_cache",
+    "/.tox",
+    "/.uv",
+    "/.ruff_cache",
+    "/.next",
+    "/.nuxt",
+    "/.parcel-cache",
+    "/.cache/",
+];
+
+/// Classify a path into a tier based on `IndexConfig`.
+/// Returns `None` if the path should be excluded entirely.
+pub fn classify_path(path: &Path, config: &IndexConfig) -> Option<DocTier> {
+    let path_str = path.to_string_lossy();
+
+    // Custom includes override everything
+    for pattern in &config.custom_includes {
+        if path_str.contains(pattern.as_str()) {
+            return Some(DocTier::Normal);
+        }
+    }
+
+    // Custom excludes take next priority
+    for pattern in &config.custom_excludes {
+        if path_str.contains(pattern.as_str()) {
+            return None;
+        }
+    }
+
+    // Is this a hidden path (dotfile / dotdir)?
+    let is_hidden = path.components().any(|c| {
+        let s = c.as_os_str().to_str().unwrap_or("");
+        // Skip "./" or "/" or ".."
+        if s == "." || s == ".." || s.is_empty() {
+            return false;
+        }
+        s.starts_with('.')
+    });
+
+    // Is this a cache / build path?
+    let is_cache = CACHE_PATTERNS.iter().any(|p| path_str.contains(p));
+
+    match (is_hidden, is_cache) {
+        (_, true) if !config.index_cache => None,
+        (_, true) => Some(DocTier::Cache),
+        (true, _) if !config.index_hidden => None,
+        (true, _) => Some(DocTier::Hidden),
+        _ => Some(DocTier::Normal),
+    }
+}
+
 // ── Scoring constants ──────────────────────────────────────────────────
 // These are calibrated so that:
 //   - Exact match always beats prefix match
@@ -53,6 +118,56 @@ const MAX_INDEX_DOCS: usize = 500_000;
 /// Interned string — cheap clone (just increment refcount).
 pub type IStr = std::sync::Arc<str>;
 
+/// Index tier classification for a document.
+/// - Tier 0 (Normal): regular user files — Desktop, Documents, Downloads, etc.
+/// - Tier 1 (Hidden): dotfiles, ~/.config, ~/.local, etc.
+/// - Tier 2 (Cache): build artifacts, node_modules, package caches, etc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocTier {
+    Normal = 0,
+    Hidden = 1,
+    Cache  = 2,
+}
+
+impl DocTier {
+    #[inline]
+    pub fn to_u8(self) -> u8 { self as u8 }
+    #[inline]
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => DocTier::Hidden,
+            2 => DocTier::Cache,
+            _ => DocTier::Normal,
+        }
+    }
+}
+
+/// Configuration that controls which files get indexed and how they are classified.
+#[derive(Debug, Clone)]
+pub struct IndexConfig {
+    pub scopes: Vec<PathBuf>,
+    /// Index hidden files and directories (dotfiles, ~/.config, ~/.local, etc.)
+    pub index_hidden: bool,
+    /// Index cache and build directories (node_modules, .cargo/registry, DerivedData, etc.)
+    pub index_cache: bool,
+    /// Additional user-specified exclude patterns (substrings checked against full path)
+    pub custom_excludes: Vec<String>,
+    /// Override patterns that force inclusion even if they match cache/hidden patterns
+    pub custom_includes: Vec<String>,
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            scopes: vec![],
+            index_hidden: false,
+            index_cache: false,
+            custom_excludes: vec![],
+            custom_includes: vec![],
+        }
+    }
+}
+
 /// A single document in the index.
 pub struct DocEntry {
     pub path: String,
@@ -73,6 +188,8 @@ pub struct DocEntry {
     pub access_count: u32,
     /// Unix timestamp of the last access.
     pub last_accessed: u64,
+    /// Index tier — controls visibility in search unless user opts in.
+    pub tier: DocTier,
 }
 
 /// In-memory trigram index.
@@ -150,16 +267,26 @@ impl TrigramIndex {
     /// Build the index by walking all scopes.
     ///
     /// This is a **blocking** CPU-bound operation. It uses a rayon thread pool
-    /// (via jwalk) to traverse directories in parallel. Known noise directories
-    /// (e.g. `node_modules`, `.git`, `DerivedData`) are skipped.
+    /// (via jwalk) to traverse directories in parallel. Noise directories
+    /// (e.g. `node_modules`, `.git`, `DerivedData`) are classified as tier 2 (Cache)
+    /// or tier 1 (Hidden) depending on `config`. Only tier 0 (Normal) is included
+    /// by default; opt-in via `config.index_hidden` / `config.index_cache`.
     pub fn build(scopes: &[PathBuf]) -> Self {
+        Self::build_with_config(&IndexConfig {
+            scopes: scopes.to_vec(),
+            ..Default::default()
+        })
+    }
+
+    /// Build with full config support — tier classification, custom includes/excludes.
+    pub fn build_with_config(config: &IndexConfig) -> Self {
         let mut docs: Vec<DocEntry> = Vec::with_capacity(1024 * 1024);
 
         let cpu_count = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
 
-        'outer: for scope in scopes {
+        'outer: for scope in &config.scopes {
             let walker = WalkDir::new(scope)
                 .parallelism(jwalk::Parallelism::RayonNewPool(cpu_count))
                 .skip_hidden(false);
@@ -168,7 +295,7 @@ impl TrigramIndex {
                 let Ok(entry) = entry else { continue };
                 let path = entry.path();
 
-                // Skip known noise directories
+                // Skip known VCS / system directories by name (always, regardless of tier)
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     if name.starts_with('.')
                         && matches!(name, ".git" | ".svn" | ".hg" | ".DS_Store")
@@ -199,18 +326,10 @@ impl TrigramIndex {
                     continue;
                 }
 
-                // Path-based exclusions
-                let path_str = path.to_string_lossy();
-                if path_str.contains("/.cargo/registry")
-                    || path_str.contains("/Library/Caches")
-                    || path_str.contains("/Library/Developer/Xcode/DerivedData")
-                    || path_str.contains("/Library/Developer/CoreSimulator")
-                    || path_str.contains("/.npm")
-                    || path_str.contains("/.pnpm-store")
-                    || path_str.contains("/go/pkg/mod")
-                {
-                    continue;
-                }
+                // Classify path into tier
+                let Some(tier) = classify_path(&path, config) else {
+                    continue; // excluded by user or by default
+                };
 
                 let name = path
                     .file_name()
@@ -264,6 +383,7 @@ impl TrigramIndex {
                     extension,
                     access_count: 0,
                     last_accessed: 0,
+                    tier,
                 });
             }
         }
@@ -355,14 +475,23 @@ impl TrigramIndex {
     /// **Early-exit optimization:** Cheap structural bonuses are computed first.
     /// If the heap is already full and the doc's best-case score (cheap + max remaining)
     /// cannot beat the current minimum, the doc is skipped entirely — no BM25, no recency,
-    /// no depth/path calculations.
+    #[inline]
+    fn tier_matches(tier: DocTier, mask: u8) -> bool {
+        (1u8 << tier.to_u8()) & mask != 0
+    }
+
     /// Fast path for extension queries like ".har", ".pdf".
     fn query_by_extension(&self, ext: &str, max: usize) -> Vec<ScoredDoc> {
+        self.query_by_extension_with_tier(ext, max, 0b111)
+    }
+
+    fn query_by_extension_with_tier(&self, ext: &str, max: usize, tier_mask: u8) -> Vec<ScoredDoc> {
         let mut results: Vec<ScoredDoc> = self
             .docs
             .iter()
             .enumerate()
             .filter(|(i, _)| !self.is_deleted(*i as u32))
+            .filter(|(_, d)| Self::tier_matches(d.tier, tier_mask))
             .filter(|(_, d)| d.extension == ext)
             .map(|(i, d)| ScoredDoc {
                 doc_id: i as u32,
@@ -374,12 +503,19 @@ impl TrigramIndex {
         results
     }
 
+    /// Query with default tier mask (all tiers).
     pub fn query(&self, query: &str, max: usize, fuzzy: bool) -> Vec<ScoredDoc> {
+        self.query_with_tier(query, max, fuzzy, 0b111)
+    }
+
+    /// Query with explicit tier mask.
+    /// `tier_mask` is a bitmask: bit 0 = Normal, bit 1 = Hidden, bit 2 = Cache.
+    pub fn query_with_tier(&self, query: &str, max: usize, fuzzy: bool, tier_mask: u8) -> Vec<ScoredDoc> {
         let query_lower = query.to_lowercase();
 
         // Extension query fast-path: ".har", ".pdf"
         if let Some(ext) = query_lower.strip_prefix('.') {
-            return self.query_by_extension(ext, max);
+            return self.query_by_extension_with_tier(ext, max, tier_mask);
         }
 
         let query_terms = tokenize(&query_lower);
@@ -387,12 +523,12 @@ impl TrigramIndex {
         let mut candidate_ids: Vec<u32> = if query_terms.is_empty() {
             return vec![];
         } else if query_terms.len() == 1 {
-            self.candidates_for_term(&query_terms[0])
+            self.candidates_for_term_with_tier(&query_terms[0], tier_mask)
         } else {
             let mut result: Option<HashSet<u32>> = None;
             for term in &query_terms {
                 let term_candidates: HashSet<u32> =
-                    self.candidates_for_term(term).into_iter().collect();
+                    self.candidates_for_term_with_tier(term, tier_mask).into_iter().collect();
                 result = Some(match result {
                     None => term_candidates,
                     Some(existing) => existing.intersection(&term_candidates).copied().collect(),
@@ -408,6 +544,9 @@ impl TrigramIndex {
             let mut extra = Vec::new();
             for (i, doc) in self.docs.iter().enumerate() {
                 if self.is_deleted(i as u32) {
+                    continue;
+                }
+                if !Self::tier_matches(doc.tier, tier_mask) {
                     continue;
                 }
                 // Fast reject: length difference > max_dist
@@ -458,6 +597,9 @@ impl TrigramIndex {
         for doc_id in candidate_ids {
             let doc = &self.docs[doc_id as usize];
             if self.is_deleted(doc_id) {
+                continue;
+            }
+            if !Self::tier_matches(doc.tier, tier_mask) {
                 continue;
             }
 
@@ -615,6 +757,10 @@ impl TrigramIndex {
     /// For very short terms we fall back to a bounded scan of docs whose name
     /// actually contains the term, ordered by recency.
     fn candidates_for_term(&self, term: &str) -> Vec<u32> {
+        self.candidates_for_term_with_tier(term, 0b111)
+    }
+
+    fn candidates_for_term_with_tier(&self, term: &str, tier_mask: u8) -> Vec<u32> {
         // Extension query shortcut: ".pdf" → match doc.extension == "pdf"
         if let Some(ext) = term.strip_prefix('.') {
             return self
@@ -622,6 +768,7 @@ impl TrigramIndex {
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| !self.is_deleted(*i as u32))
+                .filter(|(_, d)| Self::tier_matches(d.tier, tier_mask))
                 .filter(|(_, d)| d.extension == ext)
                 .map(|(i, _)| i as u32)
                 .collect();
@@ -635,6 +782,9 @@ impl TrigramIndex {
                 BinaryHeap::with_capacity(SHORT_QUERY_CANDIDATE_LIMIT + 1);
             for (i, doc) in self.docs.iter().enumerate() {
                 if self.is_deleted(i as u32) {
+                    continue;
+                }
+                if !Self::tier_matches(doc.tier, tier_mask) {
                     continue;
                 }
                 heap.push((std::cmp::Reverse(doc.mtime), i as u32));
@@ -652,6 +802,7 @@ impl TrigramIndex {
                     let filtered: RoaringBitmap = bitmap
                         .iter()
                         .filter(|&id| !self.is_deleted(id))
+                        .filter(|&id| Self::tier_matches(self.docs[id as usize].tier, tier_mask))
                         .collect();
                     match candidates {
                         None => candidates = Some(filtered),
@@ -803,6 +954,7 @@ impl TrigramIndex {
             extension,
             access_count: 0,
             last_accessed: 0,
+            tier: DocTier::Normal,
         });
         self.path_to_id.insert(path_str, doc_id);
 
@@ -1151,6 +1303,7 @@ mod tests {
                 extension,
                 access_count: 0,
                 last_accessed: 0,
+                tier: DocTier::Normal,
             });
             index.path_to_id.insert(path.clone(), doc_id);
             let trigrams = extract_trigrams(&name_lower);
@@ -1518,5 +1671,150 @@ mod tests {
         let matcha = idx.query("matcha", 10, true);
         assert!(matcha.len() >= coffee.len(),
             "new body should replace old: coffee={}, matcha={}", coffee.len(), matcha.len());
+    }
+
+    // ── Tier classification tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_classify_path_hidden_without_opt_in_is_excluded() {
+        let config = IndexConfig {
+            scopes: vec![PathBuf::from("/home/user")],
+            index_hidden: false,
+            index_cache: false,
+            custom_excludes: vec![],
+            custom_includes: vec![],
+        };
+        assert_eq!(classify_path(Path::new("/home/user/.config/nvim/init.lua"), &config), None);
+        assert_eq!(classify_path(Path::new("/home/user/.bashrc"), &config), None);
+        assert_eq!(
+            classify_path(Path::new("/home/user/Documents/file.txt"), &config),
+            Some(DocTier::Normal)
+        );
+    }
+
+    #[test]
+    fn test_classify_path_hidden_with_opt_in_is_included() {
+        let config = IndexConfig {
+            scopes: vec![PathBuf::from("/home/user")],
+            index_hidden: true,
+            index_cache: false,
+            custom_excludes: vec![],
+            custom_includes: vec![],
+        };
+        assert_eq!(
+            classify_path(Path::new("/home/user/.config/nvim/init.lua"), &config),
+            Some(DocTier::Hidden)
+        );
+        assert_eq!(
+            classify_path(Path::new("/home/user/.bashrc"), &config),
+            Some(DocTier::Hidden)
+        );
+    }
+
+    #[test]
+    fn test_classify_path_cache_with_opt_in_is_included() {
+        let config = IndexConfig {
+            scopes: vec![PathBuf::from("/home/user")],
+            index_hidden: false,
+            index_cache: true,
+            custom_excludes: vec![],
+            custom_includes: vec![],
+        };
+        assert_eq!(
+            classify_path(Path::new("/home/user/.cargo/registry/src/foo/bar.rs"), &config),
+            Some(DocTier::Cache)
+        );
+        assert_eq!(
+            classify_path(Path::new("/home/user/project/node_modules/lodash/index.js"), &config),
+            Some(DocTier::Cache)
+        );
+    }
+
+    #[test]
+    fn test_classify_path_custom_include_overrides() {
+        let config = IndexConfig {
+            scopes: vec![PathBuf::from("/home/user")],
+            index_hidden: false,
+            index_cache: false,
+            custom_excludes: vec![],
+            custom_includes: vec![".config/nvim".to_string()],
+        };
+        // Even though it's hidden, custom_include forces Normal tier
+        assert_eq!(
+            classify_path(Path::new("/home/user/.config/nvim/init.lua"), &config),
+            Some(DocTier::Normal)
+        );
+    }
+
+    #[test]
+    fn test_classify_path_custom_exclude_takes_priority() {
+        let config = IndexConfig {
+            scopes: vec![PathBuf::from("/home/user")],
+            index_hidden: true,
+            index_cache: true,
+            custom_excludes: vec!["secret".to_string()],
+            custom_includes: vec![],
+        };
+        assert_eq!(
+            classify_path(Path::new("/home/user/secret/password.txt"), &config),
+            None
+        );
+    }
+
+    #[test]
+    fn test_query_with_tier_filters_by_tier_mask() {
+        let mut idx = make_index_with(&[
+            ("/a/normal.txt".into(), "budget".into(), 0),
+            ("/b/.hidden.txt".into(), "budget".into(), 0),
+            ("/c/node_modules/pkg/index.js".into(), "budget".into(), 0),
+        ]);
+        // Manually set tiers
+        idx.docs[0].tier = DocTier::Normal;
+        idx.docs[1].tier = DocTier::Hidden;
+        idx.docs[2].tier = DocTier::Cache;
+        // Rebuild path_to_id and index after manual mutation (tokens already set)
+        idx.path_to_id = idx.docs.iter().enumerate().map(|(i, d)| (d.path.clone(), i as u32)).collect();
+        idx.index.clear();
+        for (i, doc) in idx.docs.iter().enumerate() {
+            for tri in extract_trigrams(&doc.name_lower) {
+                idx.index.entry(tri).or_default().insert(i as u32);
+            }
+        }
+
+        // Default mask (Normal only) → 1 result
+        let normal_only = idx.query_with_tier("budget", 10, true, 0b001);
+        assert_eq!(normal_only.len(), 1);
+        assert_eq!(normal_only[0].doc_id, 0);
+
+        // Hidden included → 2 results
+        let with_hidden = idx.query_with_tier("budget", 10, true, 0b011);
+        let ids: Vec<u32> = with_hidden.iter().map(|s| s.doc_id).collect();
+        assert!(ids.contains(&0));
+        assert!(ids.contains(&1));
+        assert!(!ids.contains(&2));
+
+        // All tiers → 3 results
+        let all = idx.query_with_tier("budget", 10, true, 0b111);
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn test_query_default_includes_all_tiers() {
+        let mut idx = make_index_with(&[
+            ("/a/normal.txt".into(), "report".into(), 0),
+            ("/b/.hidden.txt".into(), "report".into(), 0),
+        ]);
+        idx.docs[0].tier = DocTier::Normal;
+        idx.docs[1].tier = DocTier::Hidden;
+        idx.path_to_id = idx.docs.iter().enumerate().map(|(i, d)| (d.path.clone(), i as u32)).collect();
+        idx.index.clear();
+        for (i, doc) in idx.docs.iter().enumerate() {
+            for tri in extract_trigrams(&doc.name_lower) {
+                idx.index.entry(tri).or_default().insert(i as u32);
+            }
+        }
+        // query() default mask is 0b111 — all tiers
+        let all = idx.query("report", 10, true);
+        assert_eq!(all.len(), 2);
     }
 }

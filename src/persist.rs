@@ -7,7 +7,7 @@ use memmap2::Mmap;
 use crate::index::{DocEntry, TrigramIndex};
 use crate::protocol::ResultKind;
 
-const CACHE_VERSION: u32 = 3; // bumped for rkyv format
+const CACHE_VERSION: u32 = 4; // bumped for tier field
 const MAGIC: &[u8] = b"SNYD";
 
 /// File layout (little-endian):
@@ -42,6 +42,7 @@ struct SerialDoc {
     extension: String,
     access_count: u32,
     last_accessed: u64,
+    tier: u8,
 }
 
 #[derive(rkyv_derive::Archive, rkyv_derive::Serialize, rkyv_derive::Deserialize)]
@@ -54,7 +55,7 @@ struct CacheFile {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 pub fn cache_path(cache_dir: &std::path::Path) -> PathBuf {
-    cache_dir.join("index_v3.bin")
+    cache_dir.join("index_v4.bin")
 }
 
 fn build_header(scopes: &[PathBuf]) -> CacheHeader {
@@ -138,6 +139,7 @@ pub fn save(
             extension: d.extension.clone(),
             access_count: d.access_count,
             last_accessed: d.last_accessed,
+            tier: d.tier.to_u8(),
         })
         .collect();
 
@@ -236,6 +238,7 @@ pub fn load(_scopes: &[PathBuf], cache_dir: &std::path::Path) -> Option<TrigramI
             extension: d.extension,
             access_count: d.access_count,
             last_accessed: d.last_accessed,
+            tier: crate::index::DocTier::from_u8(d.tier),
         })
         .collect();
 
@@ -255,7 +258,7 @@ mod tests {
     #[test]
     fn test_roundtrip_save_load() {
         let _guard = CACHE_LOCK.lock().unwrap();
-        let dir = std::env::temp_dir().join("snyd_test_persist_v3");
+        let dir = std::env::temp_dir().join("snyd_test_persist_v4");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "test").unwrap();
@@ -264,7 +267,7 @@ mod tests {
         let doc_count = idx.docs.len();
         assert!(doc_count > 0);
 
-        let cache_dir = std::env::temp_dir().join("snyd_test_cache_v3");
+        let cache_dir = std::env::temp_dir().join("snyd_test_cache_v4");
         save(&idx, &[dir.clone()], &cache_dir).unwrap();
 
         let loaded = load(&[dir.clone()], &cache_dir).expect("should load successfully");
@@ -279,8 +282,8 @@ mod tests {
     #[test]
     fn test_stale_cache_returns_none() {
         let _guard = CACHE_LOCK.lock().unwrap();
-        let dir = std::env::temp_dir().join("snyd_test_stale_v3");
-        let cache_dir = std::env::temp_dir().join("snyd_test_stale_cache_v3");
+        let dir = std::env::temp_dir().join("snyd_test_stale_v4");
+        let cache_dir = std::env::temp_dir().join("snyd_test_stale_cache_v4");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&cache_dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -328,8 +331,8 @@ mod tests {
     #[test]
     fn test_cache_expires_after_24h() {
         let _guard = CACHE_LOCK.lock().unwrap();
-        let dir = std::env::temp_dir().join("snyd_test_expire_v3");
-        let cache_dir = std::env::temp_dir().join("snyd_test_expire_cache_v3");
+        let dir = std::env::temp_dir().join("snyd_test_expire_v4");
+        let cache_dir = std::env::temp_dir().join("snyd_test_expire_cache_v4");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&cache_dir);
         std::fs::create_dir_all(&dir).unwrap();

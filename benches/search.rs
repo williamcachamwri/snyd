@@ -65,6 +65,7 @@ fn build_index_from_corpus(corpus: &[(String, String, u64)]) -> TrigramIndex {
                 extension,
                 access_count: 0,
                 last_accessed: 0,
+                tier: snyd::index::DocTier::Normal,
             }
         })
         .collect();
@@ -133,6 +134,7 @@ fn bench_query_latency(c: &mut Criterion) {
             kind_filter: None,
             content_batch: vec![],
             fuzzy: true,
+            tier_mask: 0b111,
         };
         group.bench_with_input(BenchmarkId::new(label, query), &req, |b, req| {
             b.to_async(&rt).iter(|| async {
@@ -257,6 +259,7 @@ fn bench_regression_guard(c: &mut Criterion) {
             kind_filter: None,
             content_batch: vec![],
             fuzzy: true,
+            tier_mask: 0b111,
         };
         group.bench_with_input(BenchmarkId::new(label, query), &req, |b, req| {
             b.to_async(&rt).iter(|| async {

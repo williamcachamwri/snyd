@@ -34,6 +34,14 @@ struct Cli {
     #[arg(short, long, env = "SNYD_CACHE")]
     cache: Option<PathBuf>,
 
+    /// Index hidden files and dot-directories (e.g. ~/.config, ~/.local)
+    #[arg(long, env = "SNYD_INDEX_HIDDEN")]
+    index_hidden: bool,
+
+    /// Index cache and build directories (e.g. node_modules, DerivedData, .cargo/registry)
+    #[arg(long, env = "SNYD_INDEX_CACHE")]
+    index_cache: bool,
+
     /// Log level filter (e.g. info, debug, warn)
     #[arg(long, default_value = "info", env = "SNYD_LOG")]
     log_level: String,
@@ -63,6 +71,8 @@ async fn main() -> io::Result<()> {
     if let Some(cache) = cli.cache {
         config.cache_dir = cache;
     }
+    config.index_hidden = cli.index_hidden;
+    config.index_cache = cli.index_cache;
 
     let socket = &config.socket_path;
 

@@ -21,6 +21,14 @@ pub struct ContentEntry {
     pub source: ContentSource,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_tier_mask() -> u8 {
+    0b001 // Tier 0 (Normal) only by default
+}
+
 /// Request sent by the Swift client over the Unix socket.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SearchRequest {
@@ -36,10 +44,11 @@ pub struct SearchRequest {
     /// Enable fuzzy fallback when trigram intersection returns few candidates.
     #[serde(default = "default_true")]
     pub fuzzy: bool,
-}
-
-fn default_true() -> bool {
-    true
+    /// Bitmask controlling which tiers to search.
+    /// 0b001 = Tier 0 (Normal), 0b010 = Tier 1 (Hidden), 0b100 = Tier 2 (Cache).
+    /// Default 0b001 — only normal files unless user opts in.
+    #[serde(default = "default_tier_mask")]
+    pub tier_mask: u8,
 }
 
 /// Individual search result.
