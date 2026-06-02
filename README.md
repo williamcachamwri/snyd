@@ -149,7 +149,7 @@ xychart-beta
 - **snyd is 70–560× faster than Spotlight (`mdfind`)** across all scenarios
 - `find` scales linearly with corpus size (O(N) scan); snyd scales with candidate count (O(candidates))
 - `mdfind` latency is ~20–21 ms regardless of query or corpus size because it is dominated by Spotlight IPC overhead
-- Fuzzy typo queries like `bdgt` are snyd's biggest win: trigram miss → parallel fuzzy fallback catches the typo in ~30 µs (1K) / ~116 µs (10K), while `find` still scans all files
+- Fuzzy typo queries like `bdgt` are snyd's biggest win: trigram miss → parallel fuzzy fallback catches the typo in ~0.03 ms (1K) / ~0.12 ms (10K), while `find` still scans all files
 
 ### Memory Efficiency
 
@@ -171,39 +171,38 @@ xychart-beta
 
 ```mermaid
 flowchart LR
-    A[1. Parse query<br/>~0 µs] --> B{2. Extension?<br/>~50 µs}
+    A[1. Parse query<br/>~0 ms] --> B{2. Extension?<br/>~0.05 ms}
     B -->|starts with .| C[Extension scan<br/>direct field match]
-    B -->|otherwise| D[3. Tokenize<br/>~10 µs]
+    B -->|otherwise| D[3. Tokenize<br/>~0.01 ms]
     D --> E[4. Candidate selection<br/>~0.5-2 ms]
     E --> F{< 100 candidates?}
     F -->|yes| G[4b. Fuzzy fallback<br/>rayon parallel D-L<br/>~1-5 ms]
     F -->|no| H[5. Scoring<br/>~1-3 ms]
     G --> H
-    H --> I[6. Return top-k<br/>~10 µs]
+    H --> I[6. Return top-k<br/>~0.01 ms]
     C --> I
 
-    style A fill:#e1f5fe,stroke:#01579b
-    style B fill:#fff3e0,stroke:#e65100
-    style C fill:#e8f5e9,stroke:#2e7d32
-    style D fill:#e1f5fe,stroke:#01579b
-    style E fill:#e1f5fe,stroke:#01579b
-    style F fill:#fff3e0,stroke:#e65100
-    style G fill:#fce4ec,stroke:#c2185b
-    style H fill:#e1f5fe,stroke:#01579b
-    style I fill:#e8f5e9,stroke:#2e7d32
+    classDef process fill:#e1f5fe,stroke:#01579b,color:#0d47a1
+    classDef decision fill:#fff3e0,stroke:#e65100,color:#bf360c
+    classDef fastpath fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+    classDef fallback fill:#fce4ec,stroke:#c2185b,color:#880e4f
+    class A,D,E,H process
+    class B,F decision
+    class C,I fastpath
+    class G fallback
 ```
 
 **Stage details:**
 
 | Stage | What happens | Time budget |
 |-------|-----------|-------------|
-| **1. Parse** | Lowercase, strip quotes | ~0 µs |
-| **2. Extension fast-path** | Query starts with `.` → direct `extension` field scan (e.g. `.pdf`, `.har`) | **~50 µs** |
-| **3. Tokenize** | Split on delimiters, extract trigrams per token | ~10 µs |
+| **1. Parse** | Lowercase, strip quotes | ~0 ms |
+| **2. Extension fast-path** | Query starts with `.` → direct `extension` field scan (e.g. `.pdf`, `.har`) | **~0.05 ms** |
+| **3. Tokenize** | Split on delimiters, extract trigrams per token | ~0.01 ms |
 | **4. Candidates** | Intersect RoaringBitmap posting lists per trigram; short queries fall back to `name.contains(term)` or recency-ordered scan | **~0.5–2 ms** |
 | **4b. Fuzzy fallback** | If < 100 candidates, spawn `rayon` parallel scan with Damerau-Levenshtein (max distance = 1–2) | **~1–5 ms** (gated) |
 | **5. Scoring** | For each candidate: cheap structural bonuses first (exact/prefix/acronym/path-segment). If heap full and `cheap_score + 90 < heap_min`, skip. Otherwise run BM25 + recency + depth. | **~1–3 ms** |
-| **6. Return** | Normalize scores to [0,1], stream JSON batches | ~10 µs |
+| **6. Return** | Normalize scores to [0,1], stream JSON batches | ~0.01 ms |
 
 ### Tier System (v0.2.3+)
 
@@ -410,7 +409,7 @@ sequenceDiagram
 - **Removed 500K hard doc cap** — index now scales to 2M+ docs, RAM-bounded
 - **Smart short queries** — 2-char terms use `name.contains(term)` filter; 3-char terms with < 5 trigram hits fall back to path/acronym scan (fixes `"src main"`)
 - **Parallel fuzzy fallback** — `rayon::join` Damerau-Levenshtein scan when < 100 candidates (was < 5), catches more typos without regressing common queries
-- **Extension query fast-path** — `.pdf`, `.har` queries scan `extension` field directly (~50 µs)
+- **Extension query fast-path** — `.pdf`, `.har` queries scan `extension` field directly (~0.05 ms)
 
 ### v0.2.3 — Tiered Index Config
 - **DocTier system** — Normal / Hidden / Cache classification at index time
